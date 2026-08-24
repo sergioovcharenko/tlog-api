@@ -32,31 +32,35 @@ async def analyze(file: UploadFile = File(...)):
         max_roll = 0.0
         max_pitch = 0.0
         
-        # Зв'язок
+        # Зв'язок & dBm
         min_rssi = 255 
-        telem_rssi = None
-        telem_remrssi = None
+        min_dbm = 0  # Сюди пишемо найгірший dBm
+        telem_rssi_raw = None
+        telem_remrssi_raw = None
         
         # Керування (PWM)
         rc_min = [9999, 9999, 9999, 9999]
         rc_max = [0, 0, 0, 0]
         max_throttle = 0
         
-        # Батарея 6S
+        # Батарея 6S (25.2V -> 16.8V)
         min_voltage = 999.0
         max_current = 0.0
         start_voltage = None 
+        voltage_at_land_mode = None
         
-        # Датчики та Вібрації
+        # Датчики, Вібрації, Навантаження
         max_vib_x, max_vib_y, max_vib_z = 0.0, 0.0, 0.0
         clip_count = 0
         max_temp = -99.0
         ekf_compass = 0.0
         ekf_vel = 0.0
         
-        has_gps = False
+        # Engine Load у режимі Loiter на висотах 50-200м
+        engine_load_loiter_max = 0
+        engine_load_samples = 0
         
-        # Час
+        has_gps = False
         first_timestamp = None
         current_timestamp = 0.0 
         
@@ -64,12 +68,12 @@ async def analyze(file: UploadFile = File(...)):
         was_armed = False
         current_mode = "Невідомо"
         flight_modes = set()
+        land_mode_triggered = False
         
-        # Детектори 0.0.0.0 та збоїв
+        # Детектори
         gps_had_lock = False
         ekf_had_origin = False
         ekf_failed_flag = False
-        gps_failed_flag = False
         
         raw_timeline = []
 
@@ -105,6 +109,8 @@ async def analyze(file: UploadFile = File(...)):
                             add_event(f"🔄 Режим змінено на {new_mode}", current_timestamp, new_mode)
                         current_mode = new_mode
                         flight_modes.add(current_mode)
+                        if current_mode == "LAND":
+                            land_mode_triggered = True
                     
                     if is_armed and not was_armed:
                         add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
@@ -114,7 +120,7 @@ async def analyze(file: UploadFile = File(...)):
                         add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
-            # --- ПОЛІТ ---
+            # --- ПОЛІТ & ENGINE LOAD У LOITER ---
             elif msg_type == 'VFR_HUD':
                 if need_alt_reset or start_alt is None:
                     start_alt = msg.alt
@@ -124,6 +130,12 @@ async def analyze(file: UploadFile = File(...)):
                 if rel_alt > max_alt: max_alt = rel_alt
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
+                
+                # Аналіз навантаження в режимі LOITER на висоті 50-200м
+                if current_mode == 'LOITER' and 50.0 <= rel_alt <= 200.0:
+                    engine_load_samples += 1
+                    if msg.throttle > engine_load_loiter_max:
+                        engine_load_loiter_max = msg.throttle
                     
             elif msg_type == 'ATTITUDE':
                 r_deg = abs(math.degrees(msg.roll))
@@ -131,15 +143,25 @@ async def analyze(file: UploadFile = File(...)):
                 if r_deg > max_roll: max_roll = r_deg
                 if p_deg > max_pitch: max_pitch = p_deg
                     
-            # --- ЖИВЛЕННЯ ---
+            # --- ЖИВЛЕННЯ (6S: 25.2V -> 16.8V) ---
             elif msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
                 curr = msg.current_battery / 100.0   
                 if start_voltage is None and volt > 5.0: start_voltage = volt
                 if 0 < volt < min_voltage: min_voltage = volt
                 if curr > max_current: max_current = curr
+                
+                # Фіксуємо напругу, коли зайшли в LAND
+                if current_mode == 'LAND' and voltage_at_land_mode is None:
+                    voltage_at_land_mode = volt
+
+                # Можна також берегти SYS_STATUS.load як Engine Load
+                if current_mode == 'LOITER':
+                    sys_load = getattr(msg, 'load', 0) / 10.0 # у відсотках
+                    if sys_load > engine_load_loiter_max:
+                        engine_load_loiter_max = sys_load
                     
-            # --- ЗВ'ЯЗОК, RC, TELEMETRY ---
+            # --- ЗВ'ЯЗОК, RC, TELEMETRY (dBm) ---
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
@@ -150,39 +172,35 @@ async def analyze(file: UploadFile = File(...)):
                         if chans[i] > rc_max[i]: rc_max[i] = chans[i]
 
             elif msg_type in ['RADIO', 'RADIO_STATUS']:
-                telem_rssi = msg.rssi
-                telem_remrssi = msg.remrssi
+                telem_rssi_raw = msg.rssi
+                telem_remrssi_raw = msg.remrssi
+                # Конвертація у від'ємні dBm (якщо модуль видає значення > 0)
+                dbm_val = msg.rssi if msg.rssi < 0 else (msg.rssi / 2.0 - 121 if msg.rssi < 200 else -msg.rssi)
+                if min_dbm == 0 or dbm_val < min_dbm:
+                    min_dbm = dbm_val
                     
-            # --- GPS та 0.0.0.0 ---
+            # --- GPS та EKF ---
             elif msg_type == 'GPS_RAW_INT':
                 if msg.satellites_visible > 0: has_gps = True
-                if msg.lat != 0 or msg.lon != 0:
-                    gps_had_lock = True
+                if msg.lat != 0 or msg.lon != 0: gps_had_lock = True
                 elif msg.lat == 0 and msg.lon == 0 and gps_had_lock:
                     add_event("🚨 КРИТИЧНО: GPS втратив позицію (0.0.0.0)", current_timestamp, current_mode, True)
                     gps_had_lock = False
-                    gps_failed_flag = True
 
             elif msg_type == 'GLOBAL_POSITION_INT':
-                if msg.lat != 0 or msg.lon != 0:
-                    ekf_had_origin = True
+                if msg.lat != 0 or msg.lon != 0: ekf_had_origin = True
                 elif msg.lat == 0 and msg.lon == 0 and ekf_had_origin:
                     add_event("🚨 КРИТИЧНО: EKF скинув координати в нуль", current_timestamp, current_mode, True)
                     ekf_had_origin = False
                     ekf_failed_flag = True
                     
-            # --- ВІБРАЦІЇ ТА EKF ---
+            # --- ВІБРАЦІЇ ---
             elif msg_type == 'VIBRATION':
                 if msg.vibration_x > max_vib_x: max_vib_x = msg.vibration_x
                 if msg.vibration_y > max_vib_y: max_vib_y = msg.vibration_y
                 if msg.vibration_z > max_vib_z: max_vib_z = msg.vibration_z
                 clip_count = max(clip_count, msg.clipping_0, msg.clipping_1, msg.clipping_2)
                 
-            elif msg_type == 'EKF_STATUS_REPORT':
-                if msg.compass_variance > ekf_compass: ekf_compass = msg.compass_variance
-                if msg.velocity_variance > ekf_vel: ekf_vel = msg.velocity_variance
-
-            # --- СИСТЕМНІ ПОВІДОМЛЕННЯ ---
             elif msg_type == 'STATUSTEXT':
                 try:
                     txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
@@ -191,14 +209,11 @@ async def analyze(file: UploadFile = File(...)):
                     add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
-        # Завершення циклу
+        # Завершення аналізу
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
-        if max_temp == -99.0: max_temp = 0.0
 
-        duration_sec = 0
-        if first_timestamp and current_timestamp:
-            duration_sec = int(current_timestamp - first_timestamp)
+        duration_sec = int(current_timestamp - first_timestamp) if first_timestamp and current_timestamp else 0
         mins, secs = divmod(duration_sec, 60)
         
         timeline = []
@@ -221,43 +236,55 @@ async def analyze(file: UploadFile = File(...)):
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
         # ==========================================
-        # 🤖 AI ВИСНОВОК ТА ДІАГНОСТИКА ВТРАТИ
+        # 🤖 AI ВИСНОВОК ТА АНАЛІЗ dBm / 6S / LOITER
         # ==========================================
         ai_alerts = []
         is_critical = False
 
+        # 1. Аналіз Живлення (6S: 25.2V -> 16.8V LAND)
+        if 0 < min_voltage <= 16.8:
+            is_critical = True
+            if land_mode_triggered:
+                ai_alerts.append(f"🪫 <b>Посадка за розрядом:</b> Напруга впала до {round(min_voltage,1)}V (поріг 16.8V). Автопілот примусово перевів борт у режим LAND.")
+            else:
+                ai_alerts.append(f"🚨 <b>Критичний розряд без LAND:</b> Напруга просіла до {round(min_voltage,1)}V (нижче 16.8V), але режим LAND не встиг відпрацювати. Можливе падіння через знеструмлення.")
+        elif 16.8 < min_voltage < 18.0:
+            ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V (межа посадки 16.8V).")
+
+        # 2. Аналіз dBm відео та телеметрії
+        if min_dbm == -128 or (telem_rssi_raw == 0 and telem_remrssi_raw == 0):
+            ai_alerts.append("📡 <b>-128 dBm: Повна втрата зв'язку:</b> Відсутній сигнал відео та телеметрії.")
+            is_critical = True
+        elif -100 <= min_dbm < -90:
+            ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу.</b> Телеметрія залишалась присутньою, але відеоканал був повністю втрачений.")
+        elif -90 <= min_dbm < -85:
+            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b> Граничний рівень сигналу, спостерігалися перешкоди та артефакти зображення.")
+        elif min_dbm < 0 and min_dbm >= -85:
+            ai_alerts.append(f"✅ <b>Рівень сигналу в нормі:</b> Рівень dBm не опускався нижче {round(min_dbm)} dBm.")
+
+        # 3. Аналіз Engine Load у режимі LOITER (50-200м)
+        if engine_load_samples > 0:
+            if engine_load_loiter_max > 85:
+                ai_alerts.append(f"⚠️ <b>Перевантаження двигунів у Loiter:</b> На висотах 50-200м Engine Load досягав {round(engine_load_loiter_max)}%. Борт працює на межі потужності (вітер або важке корисне навантаження).")
+            else:
+                ai_alerts.append(f"⚙️ <b>Engine Load у Loiter:</b> На висоті 50-200м навантаження двигунів склало до {round(engine_load_loiter_max)}% (норма).")
+
+        # 4. Аналіз обриву логу та нахилів
         if was_armed:
-            ai_alerts.append("❗️ <b>Раптовий обрив логу:</b> Файл телеметрії закінчився, коли двигуни ще працювали. Це 99% ознака падіння, перебиття живлення або збиття борту.")
+            ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах. Ознака фізичного знищення або влучання.")
             is_critical = True
 
         if max_roll > 80 or max_pitch > 80:
-            ai_alerts.append(f"🔄 <b>Аномальний кут:</b> Зафіксовано нахил {max(max_roll, max_pitch)}°. Борт перекинувся в повітрі (зрив потоку або втрата пропелера).")
+            ai_alerts.append(f"🔄 <b>Перевороти в повітрі:</b> Зафіксовано нахил {max(max_roll, max_pitch)}°.")
             is_critical = True
-
-        if 0 < min_voltage <= 16.8:
-            ai_alerts.append(f"🪫 <b>Критичне живлення:</b> Напруга впала до {round(min_voltage,1)}V (мертва зона для 6S). Батарея не витримала навантаження.")
-            is_critical = True
-        elif 0 < min_voltage < 18.0:
-            ai_alerts.append(f"🔋 <b>Просадка батареї:</b> Напруга падала нижче 18V ({round(min_voltage,1)}V).")
-
-        if clip_count > 100:
-            ai_alerts.append(f"📳 <b>Екстремальні вібрації:</b> Значення Clipping = {clip_count}. Раму трусило настільки сильно, що гіроскоп втратив орієнтацію.")
-            is_critical = True
-
-        if ekf_failed_flag:
-            ai_alerts.append("🚨 <b>Збій навігації (EKF):</b> Автопілот скинув координати в 0.0.0.0. Без GPS/компасних даних політ в автоматичних режимах став неможливим.")
-            is_critical = True
-            
-        if rssi_percent < 20 and min_rssi != 255:
-            ai_alerts.append("📡 <b>Втрата зв'язку:</b> Рівень RC RSSI падав до критичних значень.")
 
         if is_critical:
-            ai_verdict = "⚠️ БОРТ ВТРАЧЕНО АБО СТАЛАСЯ КРИТИЧНА АВАРІЯ. Зверніть увагу на фактори:"
+            ai_verdict = "⚠️ БОРТ ВТРАЧЕНО АБО СТАЛАСЯ АВАРІЙНА СИТУАЦІЯ:"
         elif len(ai_alerts) > 0:
-            ai_verdict = "⚠️ Політ завершено, але зафіксовано серйозні відхилення:"
+            ai_verdict = "📊 РЕЗУЛЬТАТИ АНАЛІЗУ ПОЛЬОТУ:"
         else:
-            ai_verdict = "✅ Політ пройшов у штатному режимі. Проблем не виявлено."
-            ai_alerts.append("Система живлення, вібрації, керування та навігація в нормі.")
+            ai_verdict = "✅ Політ пройшов у штатному режимі."
+            ai_alerts.append("Усі системи (6S, Loiter, Зв'язок) відпрацювали без зауважень.")
 
         return {
             "success": True,
@@ -285,8 +312,8 @@ async def analyze(file: UploadFile = File(...)):
                 "rssi": f"{rssi_percent}%" if min_rssi != 255 else "Немає",
                 "maxThrottle": f"{max_throttle}%",
                 "hasGps": "Присутній" if has_gps else "Без GPS",
-                "telemRssi": str(telem_rssi) if telem_rssi is not None else "—",
-                "telemRemRssi": str(telem_remrssi) if telem_remrssi is not None else "—",
+                "telemRssi": f"{round(min_dbm)} dBm" if min_dbm != 0 else "—",
+                "telemRemRssi": str(telem_remrssi_raw) if telem_remrssi_raw is not None else "—",
                 "ch1": format_rc(0),
                 "ch2": format_rc(1),
                 "ch3": format_rc(2),
@@ -298,7 +325,7 @@ async def analyze(file: UploadFile = File(...)):
                 "vibZ": round(max_vib_z, 1),
                 "clipping": clip_count,
                 "maxTemp": round(max_temp, 1),
-                "ekfCompass": round(ekf_compass, 2)
+                "engineLoadLoiter": f"{round(engine_load_loiter_max)}%" if engine_load_samples > 0 else "Немає даних"
             },
             "timeline": timeline
         }
