@@ -34,13 +34,15 @@ async def analyze(file: UploadFile = File(...)):
         
         # Поточні параметри для хронології
         curr_alt = 0.0
+        curr_dist = 0.0
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
         curr_dbm = 0
         
-        # Дальномір
+        # Дальномір / Локальна позиція
         max_rf_alt = 0.0
+        max_dist = 0.0
         has_rangefinder = False
         rangefinder_failed_flag = False
         
@@ -51,8 +53,9 @@ async def analyze(file: UploadFile = File(...)):
         telem_remrssi_raw = None
         
         # Керування (PWM)
-        rc_min = [9999, 9999, 9999, 9999]
-        rc_max = [0, 0, 0, 0]
+        rc_min = {i: 9999 for i in range(1, 9)}
+        rc_max = {i: 0 for i in range(1, 9)}
+        last_rc_state = {i: 0 for i in range(1, 9)}
         max_throttle = 0
         
         # Батарея 6S
@@ -60,6 +63,7 @@ async def analyze(file: UploadFile = File(...)):
         max_current = 0.0
         start_voltage = None 
         voltage_at_land_mode = None
+        reboot_or_second_battery = False
         
         # Датчики та Вібрації
         max_vib_x, max_vib_y, max_vib_z = 0.0, 0.0, 0.0
@@ -89,9 +93,10 @@ async def analyze(file: UploadFile = File(...)):
             raw_timeline.append({
                 "timestamp": t_stamp or 0,
                 "mode": mode,
-                "alt": f"{round(curr_alt, 1)} м" if curr_alt >= 0 else "0 м",
+                "alt": f"{round(curr_alt, 1)} м",
+                "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
                 "volt": round(curr_voltage, 1) if curr_voltage > 0 else "—",
-                "curr": f"{round(curr_amp, 1)} А" if curr_amp > 0 else "0 А",
+                "curr": f"{round(curr_amp, 1)} А" if curr_amp > 0 else "0.0 А",
                 "rssi": f"{curr_rssi_pct}%" if curr_rssi_pct > 0 else "—",
                 "dbm": f"{round(curr_dbm)} dBm" if curr_dbm != 0 else "—",
                 "text": text,
@@ -111,37 +116,17 @@ async def analyze(file: UploadFile = File(...)):
                 if first_timestamp is None: 
                     first_timestamp = t_stamp
 
-            # --- РОЗРАХУНОК ВИСОТИ (З урахуванням офсету 100м) ---
-            if msg_type == 'VFR_HUD':
-                if need_alt_reset or start_alt is None:
-                    start_alt = msg.alt
-                    need_alt_reset = False
-                
-                # Віднімаємо початкову висоту тиску (100м -> 0м)
-                rel_alt = msg.alt - (start_alt or 0.0)
-                curr_alt = max(0.0, rel_alt)
-                
-                if curr_alt > max_alt and curr_alt < 500.0:
-                    max_alt = curr_alt
-                
-                if msg.groundspeed > max_speed: max_speed = msg.groundspeed
-                if msg.throttle > max_throttle: max_throttle = msg.throttle
-
-            elif msg_type in ['RANGEFINDER', 'DISTANCE_SENSOR']:
-                rf_dist = getattr(msg, 'distance', 0)
-                if msg_type == 'DISTANCE_SENSOR':
-                    rf_dist = getattr(msg, 'current_distance', 0) / 100.0
-                if 0.05 <= rf_dist <= 100.0:
-                    has_rangefinder = True
-                    curr_alt = rf_dist
-                    if rf_dist > max_rf_alt: max_rf_alt = rf_dist
-
-            # --- ЖИВЛЕННЯ ---
-            elif msg_type == 'SYS_STATUS':
+            # --- ЖИВЛЕННЯ & ПЕРЕПІДКТЮЧЕННЯ ---
+            if msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
                 curr = msg.current_battery / 100.0   
                 
                 if volt > 5.0:
+                    if curr_voltage > 5.0 and curr_voltage < 22.0 and volt > 24.5:
+                        reboot_or_second_battery = True
+                        need_alt_reset = True
+                        add_event("🔋 Заміна батареї / Новий політ", current_timestamp, current_mode)
+                    
                     curr_voltage = volt
                     if start_voltage is None: start_voltage = volt
                     if volt < min_voltage: min_voltage = volt
@@ -160,16 +145,65 @@ async def analyze(file: UploadFile = File(...)):
                         if vnav_val < vnav_quality_min_loiter: vnav_quality_min_loiter = vnav_val
                         if vnav_val > vnav_quality_max_loiter: vnav_quality_max_loiter = vnav_val
 
+            # --- ВИСОТА ТА ДАЛЬНІСТЬ (LOCAL POSITION / VFR_HUD) ---
+            elif msg_type == 'VFR_HUD':
+                if start_alt is None or need_alt_reset:
+                    start_alt = msg.alt
+                    need_alt_reset = False
+                
+                calculated_alt = msg.alt - start_alt
+                curr_alt = max(0.0, calculated_alt)
+                
+                if curr_alt > max_alt and curr_alt < 500.0:
+                    max_alt = curr_alt
+                
+                if msg.groundspeed > max_speed: max_speed = msg.groundspeed
+                if msg.throttle > max_throttle: max_throttle = msg.throttle
+
+            elif msg_type in ['LOCAL_POSITION_NED', 'POSITION_TARGET_LOCAL_NED']:
+                x = getattr(msg, 'x', 0.0)
+                y = getattr(msg, 'y', 0.0)
+                d_val = math.sqrt(x*x + y*y)
+                if 0.0 <= d_val <= 10000.0:
+                    curr_dist = d_val
+                    if curr_dist > max_dist:
+                        max_dist = curr_dist
+
+            elif msg_type in ['RANGEFINDER', 'DISTANCE_SENSOR']:
+                rf_dist = getattr(msg, 'distance', 0)
+                if msg_type == 'DISTANCE_SENSOR':
+                    rf_dist = getattr(msg, 'current_distance', 0) / 100.0
+                
+                if 0.1 <= rf_dist <= 50.0 and not rangefinder_failed_flag:
+                    has_rangefinder = True
+                    curr_alt = rf_dist
+                    if rf_dist > max_rf_alt: 
+                        max_rf_alt = rf_dist
+
             # --- ЗВ'ЯЗОК & RC ---
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
                     curr_rssi_pct = round((msg.rssi / 254.0) * 100)
-                chans = [msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw]
-                for i in range(4):
-                    if 500 < chans[i] < 2500:
-                        if chans[i] < rc_min[i]: rc_min[i] = chans[i]
-                        if chans[i] > rc_max[i]: rc_max[i] = chans[i]
+                
+                chans = [
+                    msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw,
+                    getattr(msg, 'chan5_raw', 0), getattr(msg, 'chan6_raw', 0),
+                    getattr(msg, 'chan7_raw', 0), getattr(msg, 'chan8_raw', 0)
+                ]
+                
+                for ch_num in range(1, 9):
+                    val = chans[ch_num - 1]
+                    if 800 < val < 2200:
+                        if val < rc_min[ch_num]: rc_min[ch_num] = val
+                        if val > rc_max[ch_num]: rc_max[ch_num] = val
+                        
+                        if ch_num >= 5:
+                            prev = last_rc_state[ch_num]
+                            if prev > 0 and abs(val - prev) > 250:
+                                state_str = "АКТИВНО" if val > 1600 else ("СЕРЕДНЄ" if 1300 <= val <= 1600 else "ВИМК")
+                                add_event(f"🎮 CH{ch_num} переведено в {state_str} ({val} us)", current_timestamp, current_mode)
+                            last_rc_state[ch_num] = val
 
             elif msg_type in ['RADIO', 'RADIO_STATUS']:
                 telem_rssi_raw = msg.rssi
@@ -207,7 +241,6 @@ async def analyze(file: UploadFile = File(...)):
                 if r_deg > max_roll: max_roll = r_deg
                 if p_deg > max_pitch: max_pitch = p_deg
 
-            # --- ВІДБИТТЯ ТОЧКИ В LOITER ---
             elif msg_type == 'GLOBAL_POSITION_INT':
                 if current_mode == 'LOITER':
                     if msg.lat != 0 or msg.lon != 0:
@@ -215,7 +248,6 @@ async def analyze(file: UploadFile = File(...)):
                     elif msg.lat == 0 and msg.lon == 0 and not loiter_has_origin:
                         loiter_origin_failed = True
 
-            # --- ВІБРАЦІЇ ---
             elif msg_type == 'VIBRATION':
                 if msg.vibration_x > max_vib_x: max_vib_x = msg.vibration_x
                 if msg.vibration_y > max_vib_y: max_vib_y = msg.vibration_y
@@ -225,19 +257,19 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == 'STATUSTEXT':
                 try:
                     txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
-                    if "No rangefinder" in txt:
+                    if "No rangefinder" in txt or "VISP: No rangefinder" in txt:
                         rangefinder_failed_flag = True
                     is_err = msg.severity <= 4
                     prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
                     add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
-        # Завершення аналізу
+        # Завершення
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
         if vnav_quality_min_loiter == 999: vnav_quality_min_loiter = 0
 
-        final_max_altitude = max_rf_alt if (has_rangefinder and max_rf_alt > 0) else max_alt
+        final_max_altitude = max_rf_alt if (has_rangefinder and max_rf_alt > 0 and not rangefinder_failed_flag) else max_alt
         duration_sec = int(current_timestamp - first_timestamp) if first_timestamp and current_timestamp else 0
         mins, secs = divmod(duration_sec, 60)
         
@@ -249,6 +281,7 @@ async def analyze(file: UploadFile = File(...)):
                 "time": f"{t_m:02d}:{t_s:02d}",
                 "mode": ev['mode'],
                 "alt": ev['alt'],
+                "dist": ev['dist'],
                 "volt": ev['volt'],
                 "curr": ev['curr'],
                 "rssi": ev['rssi'],
@@ -259,20 +292,16 @@ async def analyze(file: UploadFile = File(...)):
 
         rssi_percent = round((min_rssi / 254.0) * 100) if min_rssi != 255 else 0
         modes_str = ", ".join(flight_modes) if flight_modes else "Невідомо"
-        
-        def format_rc(idx):
-            if rc_min[idx] == 9999: return "—"
-            if rc_max[idx] - rc_min[idx] < 10: return f"{rc_min[idx]} (Не задіяний)"
-            return f"{rc_min[idx]} - {rc_max[idx]}"
 
-        # ==========================================
-        # 🤖 AI ВИСНОВОК ТА ДІАГНОСТИКА
-        # ==========================================
+        # AI Висновок
         ai_alerts = []
         is_critical = False
 
+        if reboot_or_second_battery:
+            ai_alerts.append("ℹ️ <b>Зафіксовано заміну батареї:</b> Напруга зросла до 25.2V. Нуль висоти перекалібровано.")
+
         if rangefinder_failed_flag:
-            ai_alerts.append("📡 <b>Відвалився далекомір (Rangefinder):</b> Система VISP втратила зв'язок із сенсором висоти. Висота рахувалася за картками тиску.")
+            ai_alerts.append("📡 <b>Відвалився далекомір (Rangefinder):</b> Система VISP втратила зв'язок із сенсором. Висота розрахована за барометром.")
 
         if 'LOITER' in flight_modes:
             if loiter_origin_failed and not loiter_has_origin:
@@ -283,16 +312,16 @@ async def analyze(file: UploadFile = File(...)):
 
             if vnav_samples > 0:
                 if vnav_quality_min_loiter < 40:
-                    ai_alerts.append(f"⚠️ <b>Низька якість Оптичної Навігації:</b> Якість розпізнавання падала до {round(vnav_quality_min_loiter)}%. Високий ризик дрейфу.")
+                    ai_alerts.append(f"⚠️ <b>Низька якість Оптичної Навігації:</b> Якість падала до {round(vnav_quality_min_loiter)}%.")
                 else:
-                    ai_alerts.append(f"👁 <b>Якість Оптичної Навігації:</b> Працювала стабільно на рівні {round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%.")
+                    ai_alerts.append(f"👁 <b>Якість Оптичної Навігації:</b> {round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%.")
 
         if 0 < min_voltage <= 16.8:
             is_critical = True
             if land_mode_triggered:
                 ai_alerts.append(f"🪫 <b>Посадка за розрядом:</b> Напруга впала до {round(min_voltage,1)}V (поріг 16.8V). Автопілот примусово перевів борт у LAND.")
             else:
-                ai_alerts.append(f"🚨 <b>Критичний розряд без LAND:</b> Напруга просіла до {round(min_voltage,1)}V (нижче 16.8V).")
+                ai_alerts.append(f"🚨 <b>Критичний розряд без LAND:</b> Напруга просіла до {round(min_voltage,1)}V.")
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V.")
 
@@ -302,14 +331,14 @@ async def analyze(file: UploadFile = File(...)):
         elif -100 <= min_dbm < -90:
             ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу.</b> Телеметрія була присутня.")
         elif -90 <= min_dbm < -85:
-            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b> Граничний рівень сигналу.")
+            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b>")
 
         if was_armed:
             ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах.")
             is_critical = True
 
         if max_roll > 80 or max_pitch > 80:
-            ai_alerts.append(f"🔄 <b>Перевороти в повітрі:</b> Зафіксовано нахил {max(max_roll, max_pitch)}°.")
+            ai_alerts.append(f"🔄 <b>Перевороти в повітрі:</b> Нахил {max(max_roll, max_pitch)}°.")
             is_critical = True
 
         if is_critical:
@@ -346,11 +375,7 @@ async def analyze(file: UploadFile = File(...)):
                 "maxThrottle": f"{max_throttle}%",
                 "hasGps": "Без GPS (Оптична навігація)" if not has_gps else "GPS Присутній",
                 "telemRssi": f"{round(min_dbm)} dBm" if min_dbm != 0 else "—",
-                "telemRemRssi": str(telem_remrssi_raw) if telem_remrssi_raw is not None else "—",
-                "ch1": format_rc(0),
-                "ch2": format_rc(1),
-                "ch3": format_rc(2),
-                "ch4": format_rc(3)
+                "telemRemRssi": str(telem_remrssi_raw) if telem_remrssi_raw is not None else "—"
             },
             "health": {
                 "vibX": round(max_vib_x, 1),
