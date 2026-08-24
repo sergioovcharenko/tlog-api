@@ -153,10 +153,10 @@ async def analyze(file: UploadFile = File(...)):
                         # Фіксуємо земну висоту строго в момент запуску
                         if latest_baro_alt > 0:
                             ground_baro_alt = latest_baro_alt
-                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
+                        add_event("🟢 Двигуни запущено", current_timestamp, current_mode)
                         was_armed = True
                     elif not is_armed and was_armed:
-                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
+                        add_event("🔴 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
             # --- 2. ЖИВЛЕННЯ & ПЕРЕПІДКТЮЧЕННЯ ---
