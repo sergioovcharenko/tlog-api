@@ -6,6 +6,20 @@ import math
 
 app = FastAPI()
 
+def parse_dbm(raw_val):
+    if raw_val is None or raw_val == 0:
+        return 0
+    # Якщо прийшло від'ємне значення
+    if raw_val < 0:
+        return raw_val
+    # Якщо прийшов uint8 (наприклад 216 -> 216 - 256 = -40 dBm)
+    if raw_val > 127:
+        return raw_val - 256
+    # Якщо прийшов SiK raw RSSI (0-100)
+    if 0 < raw_val <= 100:
+        return round(raw_val / 1.9 - 127)
+    return -raw_val
+
 @app.get("/")
 def root(): return {"status": "ok"}
 
@@ -145,7 +159,7 @@ async def analyze(file: UploadFile = File(...)):
                         if vnav_val < vnav_quality_min_loiter: vnav_quality_min_loiter = vnav_val
                         if vnav_val > vnav_quality_max_loiter: vnav_quality_max_loiter = vnav_val
 
-            # --- ВИСОТА ТА ДАЛЬНІСТЬ (LOCAL POSITION / VFR_HUD) ---
+            # --- ВИСОТА ТА ДАЛЬНІСТЬ ---
             elif msg_type == 'VFR_HUD':
                 if start_alt is None or need_alt_reset:
                     start_alt = msg.alt
@@ -180,7 +194,7 @@ async def analyze(file: UploadFile = File(...)):
                     if rf_dist > max_rf_alt: 
                         max_rf_alt = rf_dist
 
-            # --- ЗВ'ЯЗОК & RC ---
+            # --- ЗВ'ЯЗОК & RC (КОРЕКТНИЙ ДЕКОД DBM) ---
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
@@ -208,7 +222,7 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type in ['RADIO', 'RADIO_STATUS']:
                 telem_rssi_raw = msg.rssi
                 telem_remrssi_raw = msg.remrssi
-                dbm_val = msg.rssi if msg.rssi < 0 else (msg.rssi / 2.0 - 121 if msg.rssi < 200 else -msg.rssi)
+                dbm_val = parse_dbm(msg.rssi)
                 curr_dbm = dbm_val
                 if min_dbm == 0 or dbm_val < min_dbm:
                     min_dbm = dbm_val
@@ -228,11 +242,11 @@ async def analyze(file: UploadFile = File(...)):
                             land_mode_triggered = True
                     
                     if is_armed and not was_armed:
-                        add_event("🟢 Двигуни запущено", current_timestamp, current_mode)
+                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
                         was_armed = True
                         need_alt_reset = True
                     elif not is_armed and was_armed:
-                        add_event("🔴 Двигуни зупинено", current_timestamp, current_mode)
+                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
             elif msg_type == 'ATTITUDE':
@@ -325,13 +339,16 @@ async def analyze(file: UploadFile = File(...)):
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V.")
 
-        if min_dbm == -128 or (telem_rssi_raw == 0 and telem_remrssi_raw == 0):
-            ai_alerts.append("📡 <b>-128 dBm: Повна втрата зв'язку:</b> Відсутній сигнал відео та телеметрії.")
+        # Точна оцінка за вашими порогами
+        if min_dbm <= -128 or (telem_rssi_raw == 0 and telem_remrssi_raw == 0):
+            ai_alerts.append("📡 <b>-128 dBm: Втрата відео та телеметрії.</b> Повний розрив каналу зв'язку.")
             is_critical = True
-        elif -100 <= min_dbm < -90:
-            ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу.</b> Телеметрія була присутня.")
-        elif -90 <= min_dbm < -85:
-            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b>")
+        elif -128 < min_dbm <= -90:
+            ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу (-90...-100 dBm).</b> Телеметрія була присутня.")
+        elif -90 < min_dbm <= -85:
+            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео (-85...-90 dBm).</b> Граничний рівень відеосигналу.")
+        elif min_dbm < 0:
+            ai_alerts.append(f"✅ <b>Рівень відео та телеметрії в нормі:</b> Мінімальний сигнал {round(min_dbm)} dBm.")
 
         if was_armed:
             ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах.")
