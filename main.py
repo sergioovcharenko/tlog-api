@@ -34,7 +34,7 @@ async def analyze(file: UploadFile = File(...)):
         
         # Зв'язок & dBm
         min_rssi = 255 
-        min_dbm = 0  # Сюди пишемо найгірший dBm
+        min_dbm = 0 
         telem_rssi_raw = None
         telem_remrssi_raw = None
         
@@ -56,11 +56,16 @@ async def analyze(file: UploadFile = File(...)):
         ekf_compass = 0.0
         ekf_vel = 0.0
         
+        # Оптична навігація (Optical Flow)
+        opt_flow_quality_min = 255
+        opt_flow_detected = False
+        loiter_has_origin = False
+        loiter_origin_failed = False
+        
         # Engine Load у режимі Loiter на висотах 50-200м
         engine_load_loiter_max = 0
         engine_load_samples = 0
         
-        has_gps = False
         first_timestamp = None
         current_timestamp = 0.0 
         
@@ -69,11 +74,6 @@ async def analyze(file: UploadFile = File(...)):
         current_mode = "Невідомо"
         flight_modes = set()
         land_mode_triggered = False
-        
-        # Детектори
-        gps_had_lock = False
-        ekf_had_origin = False
-        ekf_failed_flag = False
         
         raw_timeline = []
 
@@ -120,7 +120,7 @@ async def analyze(file: UploadFile = File(...)):
                         add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
-            # --- ПОЛІТ & ENGINE LOAD У LOITER ---
+            # --- ПОЛІТ & LOITER ---
             elif msg_type == 'VFR_HUD':
                 if need_alt_reset or start_alt is None:
                     start_alt = msg.alt
@@ -131,7 +131,7 @@ async def analyze(file: UploadFile = File(...)):
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
                 
-                # Аналіз навантаження в режимі LOITER на висоті 50-200м
+                # Аналіз навантаження двигунів у LOITER на висоті 50-200м
                 if current_mode == 'LOITER' and 50.0 <= rel_alt <= 200.0:
                     engine_load_samples += 1
                     if msg.throttle > engine_load_loiter_max:
@@ -151,13 +151,11 @@ async def analyze(file: UploadFile = File(...)):
                 if 0 < volt < min_voltage: min_voltage = volt
                 if curr > max_current: max_current = curr
                 
-                # Фіксуємо напругу, коли зайшли в LAND
                 if current_mode == 'LAND' and voltage_at_land_mode is None:
                     voltage_at_land_mode = volt
 
-                # Можна також берегти SYS_STATUS.load як Engine Load
                 if current_mode == 'LOITER':
-                    sys_load = getattr(msg, 'load', 0) / 10.0 # у відсотках
+                    sys_load = getattr(msg, 'load', 0) / 10.0
                     if sys_load > engine_load_loiter_max:
                         engine_load_loiter_max = sys_load
                     
@@ -174,26 +172,25 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type in ['RADIO', 'RADIO_STATUS']:
                 telem_rssi_raw = msg.rssi
                 telem_remrssi_raw = msg.remrssi
-                # Конвертація у від'ємні dBm (якщо модуль видає значення > 0)
                 dbm_val = msg.rssi if msg.rssi < 0 else (msg.rssi / 2.0 - 121 if msg.rssi < 200 else -msg.rssi)
                 if min_dbm == 0 or dbm_val < min_dbm:
                     min_dbm = dbm_val
-                    
-            # --- GPS та EKF ---
-            elif msg_type == 'GPS_RAW_INT':
-                if msg.satellites_visible > 0: has_gps = True
-                if msg.lat != 0 or msg.lon != 0: gps_had_lock = True
-                elif msg.lat == 0 and msg.lon == 0 and gps_had_lock:
-                    add_event("🚨 КРИТИЧНО: GPS втратив позицію (0.0.0.0)", current_timestamp, current_mode, True)
-                    gps_had_lock = False
+
+            # --- ОПТИЧНА НАВІГАЦІЯ ТА ВІДБИТТЯ В LOITER ---
+            elif msg_type == 'OPTICAL_FLOW':
+                opt_flow_detected = True
+                if hasattr(msg, 'quality'):
+                    if msg.quality < opt_flow_quality_min:
+                        opt_flow_quality_min = msg.quality
 
             elif msg_type == 'GLOBAL_POSITION_INT':
-                if msg.lat != 0 or msg.lon != 0: ekf_had_origin = True
-                elif msg.lat == 0 and msg.lon == 0 and ekf_had_origin:
-                    add_event("🚨 КРИТИЧНО: EKF скинув координати в нуль", current_timestamp, current_mode, True)
-                    ekf_had_origin = False
-                    ekf_failed_flag = True
-                    
+                # У режимі LOITER перевіряємо, чи відбилися координати від оптичної системи
+                if current_mode == 'LOITER':
+                    if msg.lat != 0 or msg.lon != 0:
+                        loiter_has_origin = True
+                    elif msg.lat == 0 and msg.lon == 0 and not loiter_has_origin:
+                        loiter_origin_failed = True
+
             # --- ВІБРАЦІЇ ---
             elif msg_type == 'VIBRATION':
                 if msg.vibration_x > max_vib_x: max_vib_x = msg.vibration_x
@@ -209,7 +206,7 @@ async def analyze(file: UploadFile = File(...)):
                     add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
-        # Завершення аналізу
+        # Завершення
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
 
@@ -236,12 +233,22 @@ async def analyze(file: UploadFile = File(...)):
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
         # ==========================================
-        # 🤖 AI ВИСНОВОК ТА АНАЛІЗ dBm / 6S / LOITER
+        # 🤖 AI ВИСНОВОК: ОПТИЧНА НАВІГАЦІЯ + 6S + LOITER
         # ==========================================
         ai_alerts = []
         is_critical = False
 
-        # 1. Аналіз Живлення (6S: 25.2V -> 16.8V LAND)
+        # 1. Оптична навігація в LOITER
+        if 'LOITER' in flight_modes:
+            if loiter_origin_failed and not loiter_has_origin:
+                ai_alerts.append("👁 <b>Збій утриманні Loiter:</b> Оптична навігація не змогла відбити координати (0.0.0.0). Перевірте контрастність поверхні або робочу висоту датчика.")
+            elif loiter_has_origin:
+                ai_alerts.append("✅ <b>Оптична навігація у Loiter:</b> Точка утримання успішно зафіксована від оптичної системи.")
+
+            if opt_flow_detected and opt_flow_quality_min < 40:
+                ai_alerts.append(f"⚠️ <b>Низька якість оптичного потоку:</b> Мінімальна якість зображення падала до {opt_flow_quality_min}/255. Можливий дрейф у Loiter.")
+
+        # 2. Живлення 6S (25.2V -> 16.8V LAND)
         if 0 < min_voltage <= 16.8:
             is_critical = True
             if land_mode_triggered:
@@ -251,7 +258,7 @@ async def analyze(file: UploadFile = File(...)):
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V (межа посадки 16.8V).")
 
-        # 2. Аналіз dBm відео та телеметрії
+        # 3. dBm Відео та Телеметрії
         if min_dbm == -128 or (telem_rssi_raw == 0 and telem_remrssi_raw == 0):
             ai_alerts.append("📡 <b>-128 dBm: Повна втрата зв'язку:</b> Відсутній сигнал відео та телеметрії.")
             is_critical = True
@@ -262,14 +269,14 @@ async def analyze(file: UploadFile = File(...)):
         elif min_dbm < 0 and min_dbm >= -85:
             ai_alerts.append(f"✅ <b>Рівень сигналу в нормі:</b> Рівень dBm не опускався нижче {round(min_dbm)} dBm.")
 
-        # 3. Аналіз Engine Load у режимі LOITER (50-200м)
+        # 4. Engine Load у LOITER (50-200м)
         if engine_load_samples > 0:
             if engine_load_loiter_max > 85:
-                ai_alerts.append(f"⚠️ <b>Перевантаження двигунів у Loiter:</b> На висотах 50-200м Engine Load досягав {round(engine_load_loiter_max)}%. Борт працює на межі потужності (вітер або важке корисне навантаження).")
+                ai_alerts.append(f"⚠️ <b>Перевантаження двигунів у Loiter:</b> На висотах 50-200м Engine Load досягав {round(engine_load_loiter_max)}%. Борт працює на межі потужності.")
             else:
                 ai_alerts.append(f"⚙️ <b>Engine Load у Loiter:</b> На висоті 50-200м навантаження двигунів склало до {round(engine_load_loiter_max)}% (норма).")
 
-        # 4. Аналіз обриву логу та нахилів
+        # 5. Обрив логу та нахили
         if was_armed:
             ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах. Ознака фізичного знищення або влучання.")
             is_critical = True
@@ -284,7 +291,6 @@ async def analyze(file: UploadFile = File(...)):
             ai_verdict = "📊 РЕЗУЛЬТАТИ АНАЛІЗУ ПОЛЬОТУ:"
         else:
             ai_verdict = "✅ Політ пройшов у штатному режимі."
-            ai_alerts.append("Усі системи (6S, Loiter, Зв'язок) відпрацювали без зауважень.")
 
         return {
             "success": True,
@@ -311,7 +317,7 @@ async def analyze(file: UploadFile = File(...)):
             "radio": {
                 "rssi": f"{rssi_percent}%" if min_rssi != 255 else "Немає",
                 "maxThrottle": f"{max_throttle}%",
-                "hasGps": "Присутній" if has_gps else "Без GPS",
+                "hasGps": "Без GPS (Оптична навігація)" if not has_gps else "GPS Присутній",
                 "telemRssi": f"{round(min_dbm)} dBm" if min_dbm != 0 else "—",
                 "telemRemRssi": str(telem_remrssi_raw) if telem_remrssi_raw is not None else "—",
                 "ch1": format_rc(0),
