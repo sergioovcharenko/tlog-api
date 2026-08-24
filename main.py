@@ -56,7 +56,7 @@ async def analyze(file: UploadFile = File(...)):
         
         has_gps = False
         
-        # --- НОВИЙ АЛГОРИТМ ЧАСУ (msg._timestamp) ---
+        # Час
         first_timestamp = None
         current_timestamp = 0.0 
         
@@ -65,9 +65,11 @@ async def analyze(file: UploadFile = File(...)):
         current_mode = "Невідомо"
         flight_modes = set()
         
-        # Детектори 0.0.0.0
+        # Детектори 0.0.0.0 та збоїв
         gps_had_lock = False
         ekf_had_origin = False
+        ekf_failed_flag = False
+        gps_failed_flag = False
         
         raw_timeline = []
 
@@ -86,7 +88,6 @@ async def analyze(file: UploadFile = File(...)):
             message_count += 1
             msg_type = msg.get_type()
             
-            # Читаємо реальний час TLOG-файлу
             t_stamp = getattr(msg, '_timestamp', 0.0)
             if t_stamp > 0:
                 current_timestamp = t_stamp
@@ -99,14 +100,12 @@ async def analyze(file: UploadFile = File(...)):
                     new_mode = mav.flightmode
                     is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                     
-                    # Зміна режиму
                     if new_mode and new_mode != current_mode:
                         if current_mode != "Невідомо":
                             add_event(f"🔄 Режим змінено на {new_mode}", current_timestamp, new_mode)
                         current_mode = new_mode
                         flight_modes.add(current_mode)
                     
-                    # Арм / Дизарм
                     if is_armed and not was_armed:
                         add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
                         was_armed = True
@@ -144,7 +143,6 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
-                
                 chans = [msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw]
                 for i in range(4):
                     if 500 < chans[i] < 2500:
@@ -163,6 +161,7 @@ async def analyze(file: UploadFile = File(...)):
                 elif msg.lat == 0 and msg.lon == 0 and gps_had_lock:
                     add_event("🚨 КРИТИЧНО: GPS втратив позицію (0.0.0.0)", current_timestamp, current_mode, True)
                     gps_had_lock = False
+                    gps_failed_flag = True
 
             elif msg_type == 'GLOBAL_POSITION_INT':
                 if msg.lat != 0 or msg.lon != 0:
@@ -170,6 +169,7 @@ async def analyze(file: UploadFile = File(...)):
                 elif msg.lat == 0 and msg.lon == 0 and ekf_had_origin:
                     add_event("🚨 КРИТИЧНО: EKF скинув координати в нуль", current_timestamp, current_mode, True)
                     ekf_had_origin = False
+                    ekf_failed_flag = True
                     
             # --- ВІБРАЦІЇ ТА EKF ---
             elif msg_type == 'VIBRATION':
@@ -181,10 +181,6 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == 'EKF_STATUS_REPORT':
                 if msg.compass_variance > ekf_compass: ekf_compass = msg.compass_variance
                 if msg.velocity_variance > ekf_vel: ekf_vel = msg.velocity_variance
-                
-            elif msg_type == 'RAW_IMU':
-                temp_c = msg.temperature / 100.0
-                if temp_c > max_temp: max_temp = temp_c
 
             # --- СИСТЕМНІ ПОВІДОМЛЕННЯ ---
             elif msg_type == 'STATUSTEXT':
@@ -195,11 +191,11 @@ async def analyze(file: UploadFile = File(...)):
                     add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
+        # Завершення циклу
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
         if max_temp == -99.0: max_temp = 0.0
 
-        # Форматування Часу
         duration_sec = 0
         if first_timestamp and current_timestamp:
             duration_sec = int(current_timestamp - first_timestamp)
@@ -224,8 +220,52 @@ async def analyze(file: UploadFile = File(...)):
             if rc_max[idx] - rc_min[idx] < 10: return f"{rc_min[idx]} (Не задіяний)"
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
+        # ==========================================
+        # 🤖 AI ВИСНОВОК ТА ДІАГНОСТИКА ВТРАТИ
+        # ==========================================
+        ai_alerts = []
+        is_critical = False
+
+        if was_armed:
+            ai_alerts.append("❗️ <b>Раптовий обрив логу:</b> Файл телеметрії закінчився, коли двигуни ще працювали. Це 99% ознака падіння, перебиття живлення або збиття борту.")
+            is_critical = True
+
+        if max_roll > 80 or max_pitch > 80:
+            ai_alerts.append(f"🔄 <b>Аномальний кут:</b> Зафіксовано нахил {max(max_roll, max_pitch)}°. Борт перекинувся в повітрі (зрив потоку або втрата пропелера).")
+            is_critical = True
+
+        if 0 < min_voltage <= 16.8:
+            ai_alerts.append(f"🪫 <b>Критичне живлення:</b> Напруга впала до {round(min_voltage,1)}V (мертва зона для 6S). Батарея не витримала навантаження.")
+            is_critical = True
+        elif 0 < min_voltage < 18.0:
+            ai_alerts.append(f"🔋 <b>Просадка батареї:</b> Напруга падала нижче 18V ({round(min_voltage,1)}V).")
+
+        if clip_count > 100:
+            ai_alerts.append(f"📳 <b>Екстремальні вібрації:</b> Значення Clipping = {clip_count}. Раму трусило настільки сильно, що гіроскоп втратив орієнтацію.")
+            is_critical = True
+
+        if ekf_failed_flag:
+            ai_alerts.append("🚨 <b>Збій навігації (EKF):</b> Автопілот скинув координати в 0.0.0.0. Без GPS/компасних даних політ в автоматичних режимах став неможливим.")
+            is_critical = True
+            
+        if rssi_percent < 20 and min_rssi != 255:
+            ai_alerts.append("📡 <b>Втрата зв'язку:</b> Рівень RC RSSI падав до критичних значень.")
+
+        if is_critical:
+            ai_verdict = "⚠️ БОРТ ВТРАЧЕНО АБО СТАЛАСЯ КРИТИЧНА АВАРІЯ. Зверніть увагу на фактори:"
+        elif len(ai_alerts) > 0:
+            ai_verdict = "⚠️ Політ завершено, але зафіксовано серйозні відхилення:"
+        else:
+            ai_verdict = "✅ Політ пройшов у штатному режимі. Проблем не виявлено."
+            ai_alerts.append("Система живлення, вібрації, керування та навігація в нормі.")
+
         return {
             "success": True,
+            "ai": {
+                "verdict": ai_verdict,
+                "isCritical": is_critical,
+                "alerts": ai_alerts
+            },
             "flight": {
                 "durationText": f"{mins} хв {secs} с",
                 "maxAltitude": round(max_alt, 1),
