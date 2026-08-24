@@ -228,11 +228,11 @@ async def analyze(file: UploadFile = File(...)):
                             land_mode_triggered = True
                     
                     if is_armed and not was_armed:
-                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
+                        add_event("🟢 Двигуни запущено", current_timestamp, current_mode)
                         was_armed = True
                         need_alt_reset = True
                     elif not is_armed and was_armed:
-                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
+                        add_event("🔴 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
             elif msg_type == 'ATTITUDE':
@@ -312,7 +312,7 @@ async def analyze(file: UploadFile = File(...)):
 
             if vnav_samples > 0:
                 if vnav_quality_min_loiter < 40:
-                    ai_alerts.append(f"⚠️ <b>Низька якість Оптичної Навігації:</b> Якість падала до {round(vnav_quality_min_loiter)}%.")
+                    ai_alerts.append(f"⚠️ <b>Низька якість Оптичної Навігації:</b> Якість розпізнавання падала до {round(vnav_quality_min_loiter)}%.")
                 else:
                     ai_alerts.append(f"👁 <b>Якість Оптичної Навігації:</b> {round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%.")
 
