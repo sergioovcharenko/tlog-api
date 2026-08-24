@@ -32,7 +32,7 @@ async def analyze(file: UploadFile = File(...)):
         max_roll = 0.0
         max_pitch = 0.0
         
-        # Поточні параметри для хронології (Чорна скринька)
+        # Поточні параметри для хронології
         curr_alt = 0.0
         curr_voltage = 0.0
         curr_amp = 0.0
@@ -42,6 +42,7 @@ async def analyze(file: UploadFile = File(...)):
         # Дальномір
         max_rf_alt = 0.0
         has_rangefinder = False
+        rangefinder_failed_flag = False
         
         # Зв'язок & dBm
         min_rssi = 255 
@@ -110,17 +111,18 @@ async def analyze(file: UploadFile = File(...)):
                 if first_timestamp is None: 
                     first_timestamp = t_stamp
 
-            # --- ПОЛІТ ТА ВИСОТА ---
+            # --- РОЗРАХУНОК ВИСОТИ (З урахуванням офсету 100м) ---
             if msg_type == 'VFR_HUD':
                 if need_alt_reset or start_alt is None:
                     start_alt = msg.alt
                     need_alt_reset = False
                 
-                rel_alt = msg.alt - start_alt
-                if rel_alt < 500.0:
-                    curr_alt = max(0.0, rel_alt)
-                    if curr_alt > max_alt:
-                        max_alt = curr_alt
+                # Віднімаємо початкову висоту тиску (100м -> 0м)
+                rel_alt = msg.alt - (start_alt or 0.0)
+                curr_alt = max(0.0, rel_alt)
+                
+                if curr_alt > max_alt and curr_alt < 500.0:
+                    max_alt = curr_alt
                 
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
@@ -129,15 +131,15 @@ async def analyze(file: UploadFile = File(...)):
                 rf_dist = getattr(msg, 'distance', 0)
                 if msg_type == 'DISTANCE_SENSOR':
                     rf_dist = getattr(msg, 'current_distance', 0) / 100.0
-                if 0.1 <= rf_dist <= 100.0:
+                if 0.05 <= rf_dist <= 100.0:
                     has_rangefinder = True
                     curr_alt = rf_dist
                     if rf_dist > max_rf_alt: max_rf_alt = rf_dist
 
-            # --- ЖИВЛЕННЯ (НАПРУГА ТА СТРУМ) ---
+            # --- ЖИВЛЕННЯ ---
             elif msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
-                curr = msg.current_battery / 100.0 # cA в Ампери
+                curr = msg.current_battery / 100.0   
                 
                 if volt > 5.0:
                     curr_voltage = volt
@@ -223,12 +225,14 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == 'STATUSTEXT':
                 try:
                     txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
+                    if "No rangefinder" in txt:
+                        rangefinder_failed_flag = True
                     is_err = msg.severity <= 4
                     prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
                     add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
-        # Завершення
+        # Завершення аналізу
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
         if vnav_quality_min_loiter == 999: vnav_quality_min_loiter = 0
@@ -261,9 +265,14 @@ async def analyze(file: UploadFile = File(...)):
             if rc_max[idx] - rc_min[idx] < 10: return f"{rc_min[idx]} (Не задіяний)"
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
-        # AI Висновок
+        # ==========================================
+        # 🤖 AI ВИСНОВОК ТА ДІАГНОСТИКА
+        # ==========================================
         ai_alerts = []
         is_critical = False
+
+        if rangefinder_failed_flag:
+            ai_alerts.append("📡 <b>Відвалився далекомір (Rangefinder):</b> Система VISP втратила зв'язок із сенсором висоти. Висота рахувалася за картками тиску.")
 
         if 'LOITER' in flight_modes:
             if loiter_origin_failed and not loiter_has_origin:
