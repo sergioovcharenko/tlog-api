@@ -12,11 +12,9 @@ def root(): return {"status": "ok"}
 @app.get("/health")
 def health(): return {"status": "ok"}
 
-# Змінено на def замість async def, щоб FastAPI запускав це у фоновому потоці 
-# і не блокував сервер під час важкого парсингу файлу.
 @app.post("/analyze")
-def analyze(file: UploadFile = File(...)):
-    data = file.file.read() # Синхронне читання
+async def analyze(file: UploadFile = File(...)):
+    data = await file.read()
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".tlog")
     
     try:
@@ -44,7 +42,7 @@ def analyze(file: UploadFile = File(...)):
         rc_max = [0, 0, 0, 0]
         max_throttle = 0
         
-        # Батарея
+        # Батарея 6S
         min_voltage = 999.0
         max_current = 0.0
         start_voltage = None 
@@ -57,12 +55,14 @@ def analyze(file: UploadFile = File(...)):
         ekf_vel = 0.0
         
         has_gps = False
+        
+        # --- НОВИЙ АЛГОРИТМ ЧАСУ (msg._timestamp) ---
         first_timestamp = None
-        last_timestamp = None
+        current_timestamp = 0.0 
         
         # Стан польоту
         was_armed = False
-        last_mode = None
+        current_mode = "Невідомо"
         flight_modes = set()
         
         # Детектори 0.0.0.0
@@ -71,10 +71,10 @@ def analyze(file: UploadFile = File(...)):
         
         raw_timeline = []
 
-        def add_event(title, text, timestamp, is_error=False):
+        def add_event(text, t_stamp, mode, is_error=False):
             raw_timeline.append({
-                "timestamp": timestamp or 0,
-                "title": title,
+                "timestamp": t_stamp or 0,
+                "mode": mode,
                 "text": text,
                 "isError": is_error
             })
@@ -86,35 +86,36 @@ def analyze(file: UploadFile = File(...)):
             message_count += 1
             msg_type = msg.get_type()
             
-            # Надійний спосіб отримання часу для tlog (секунди з початку епохи)
-            current_timestamp = getattr(msg, '_timestamp', 0)
-            
-            if current_timestamp > 0:
-                if first_timestamp is None: first_timestamp = current_timestamp
-                last_timestamp = current_timestamp
+            # Читаємо реальний час TLOG-файлу
+            t_stamp = getattr(msg, '_timestamp', 0.0)
+            if t_stamp > 0:
+                current_timestamp = t_stamp
+                if first_timestamp is None: 
+                    first_timestamp = t_stamp
             
             # --- РЕЖИМИ ТА АРМІНГ ---
             if msg_type == 'HEARTBEAT':
                 if msg.get_srcComponent() == 1:
-                    current_mode = mav.flightmode
+                    new_mode = mav.flightmode
                     is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                     
-                    if is_armed and not was_armed:
-                        add_event("🔴 ARMED", "Дрон озброєно (двигуни активні)", current_timestamp)
-                        was_armed = True
-                        need_alt_reset = True 
-                        
-                    elif not is_armed and was_armed:
-                        add_event("🟢 DISARMED", "Дрон знято з охорони", current_timestamp)
-                        was_armed = False
-                        
-                    if current_mode and current_mode != last_mode:
-                        if last_mode is not None:
-                            add_event("🔄 РЕЖИМ", f"Зміна режиму: {last_mode} -> {current_mode}", current_timestamp)
+                    # Зміна режиму
+                    if new_mode and new_mode != current_mode:
+                        if current_mode != "Невідомо":
+                            add_event(f"🔄 Режим змінено на {new_mode}", current_timestamp, new_mode)
+                        current_mode = new_mode
                         flight_modes.add(current_mode)
-                        last_mode = current_mode
+                    
+                    # Арм / Дизарм
+                    if is_armed and not was_armed:
+                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
+                        was_armed = True
+                        need_alt_reset = True
+                    elif not is_armed and was_armed:
+                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
+                        was_armed = False
 
-            # --- ПОЛІТ (Висота та швидкість) ---
+            # --- ПОЛІТ ---
             elif msg_type == 'VFR_HUD':
                 if need_alt_reset or start_alt is None:
                     start_alt = msg.alt
@@ -122,7 +123,6 @@ def analyze(file: UploadFile = File(...)):
                 
                 rel_alt = msg.alt - start_alt
                 if rel_alt > max_alt: max_alt = rel_alt
-                
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
                     
@@ -142,7 +142,7 @@ def analyze(file: UploadFile = File(...)):
                     
             # --- ЗВ'ЯЗОК, RC, TELEMETRY ---
             elif msg_type == 'RC_CHANNELS':
-                if hasattr(msg, 'rssi') and 0 < msg.rssi < 255: # Уникаємо значення 255
+                if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
                 
                 chans = [msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw]
@@ -161,14 +161,14 @@ def analyze(file: UploadFile = File(...)):
                 if msg.lat != 0 or msg.lon != 0:
                     gps_had_lock = True
                 elif msg.lat == 0 and msg.lon == 0 and gps_had_lock:
-                    add_event("🚨 0.0.0.0", f"КРИТИЧНО: GPS втратив позицію (Режим: {last_mode})", current_timestamp, True)
+                    add_event("🚨 КРИТИЧНО: GPS втратив позицію (0.0.0.0)", current_timestamp, current_mode, True)
                     gps_had_lock = False
 
             elif msg_type == 'GLOBAL_POSITION_INT':
                 if msg.lat != 0 or msg.lon != 0:
                     ekf_had_origin = True
                 elif msg.lat == 0 and msg.lon == 0 and ekf_had_origin:
-                    add_event("🚨 EKF 0.0.0.0", f"КРИТИЧНО: EKF скинув координати в нуль (Режим: {last_mode})", current_timestamp, True)
+                    add_event("🚨 КРИТИЧНО: EKF скинув координати в нуль", current_timestamp, current_mode, True)
                     ekf_had_origin = False
                     
             # --- ВІБРАЦІЇ ТА EKF ---
@@ -191,17 +191,18 @@ def analyze(file: UploadFile = File(...)):
                 try:
                     txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
                     is_err = msg.severity <= 4
-                    add_event("⚠️ ПОМИЛКА" if is_err else "ℹ️ ІНФО", txt, current_timestamp, is_err)
+                    prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
+                    add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err)
                 except: pass
 
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
         if max_temp == -99.0: max_temp = 0.0
 
-        # Час (переведено на використання _timestamp в секундах)
+        # Форматування Часу
         duration_sec = 0
-        if first_timestamp and last_timestamp:
-            duration_sec = int(last_timestamp - first_timestamp)
+        if first_timestamp and current_timestamp:
+            duration_sec = int(current_timestamp - first_timestamp)
         mins, secs = divmod(duration_sec, 60)
         
         timeline = []
@@ -210,7 +211,7 @@ def analyze(file: UploadFile = File(...)):
             t_m, t_s = divmod(max(0, t_sec), 60)
             timeline.append({
                 "time": f"{t_m:02d}:{t_s:02d}",
-                "title": ev['title'],
+                "mode": ev['mode'],
                 "text": ev['text'],
                 "isError": ev['isError']
             })
