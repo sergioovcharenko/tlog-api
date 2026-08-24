@@ -48,11 +48,15 @@ async def analyze(file: UploadFile = File(...)):
         has_gps = False
         first_time_ms = None
         last_time_ms = None
+        current_time_ms = 0 # Глобальний трекер часу
         
         # Стан польоту
         was_armed = False
         last_mode = None
         flight_modes = set()
+        
+        # Детектор 0.0.0.0
+        had_zero_coords = False
         
         # Хронологія
         raw_timeline = []
@@ -71,31 +75,32 @@ async def analyze(file: UploadFile = File(...)):
             
             message_count += 1
             msg_type = msg.get_type()
+            
+            # Оновлюємо глобальний час
             t_ms = getattr(msg, 'time_boot_ms', 0)
-
             if t_ms > 0:
+                current_time_ms = t_ms
                 if first_time_ms is None: first_time_ms = t_ms
                 last_time_ms = t_ms
             
             # --- РЕЖИМИ ТА АРМІНГ ---
             if msg_type == 'HEARTBEAT':
-                current_mode = mav.flightmode
-                is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                
-                # Перевірка на Арм/Дизарм
-                if is_armed and not was_armed:
-                    add_event("🔴 ARMED", "Дрон озброєно (двигуни активні)", t_ms)
-                    was_armed = True
-                elif not is_armed and was_armed:
-                    add_event("🟢 DISARMED", "Дрон знято з охорони", t_ms)
-                    was_armed = False
+                if msg.get_srcComponent() == 1:
+                    current_mode = mav.flightmode
+                    is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                     
-                # Перевірка зміни режиму
-                if current_mode and current_mode != last_mode:
-                    if last_mode is not None:
-                        add_event("🔄 РЕЖИМ", f"Зміна режиму: {last_mode} -> {current_mode}", t_ms)
-                    flight_modes.add(current_mode)
-                    last_mode = current_mode
+                    if is_armed and not was_armed:
+                        add_event("🔴 ARMED", "Дрон озброєно (двигуни активні)", current_time_ms)
+                        was_armed = True
+                    elif not is_armed and was_armed:
+                        add_event("🟢 DISARMED", "Дрон знято з охорони", current_time_ms)
+                        was_armed = False
+                        
+                    if current_mode and current_mode != last_mode:
+                        if last_mode is not None:
+                            add_event("🔄 РЕЖИМ", f"Зміна режиму: {last_mode} -> {current_mode}", current_time_ms)
+                        flight_modes.add(current_mode)
+                        last_mode = current_mode
 
             # --- ПОЛІТ ---
             elif msg_type == 'VFR_HUD':
@@ -123,8 +128,27 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
+                    
             elif msg_type == 'GPS_RAW_INT':
                 if msg.satellites_visible > 0: has_gps = True
+                # Перевірка на нульові координати від самого GPS модуля
+                if msg.lat == 0 and msg.lon == 0:
+                    if not had_zero_coords:
+                        mode_info = f" (Режим: {last_mode})" if last_mode else ""
+                        add_event("🚨 0.0.0.0", f"КРИТИЧНО: GPS втратив позицію (0.0.0.0){mode_info}", current_time_ms, True)
+                        had_zero_coords = True
+                else:
+                    had_zero_coords = False
+
+            elif msg_type == 'GLOBAL_POSITION_INT':
+                # Перевірка на нульові координати від EKF (глобальна оцінка позиції)
+                if msg.lat == 0 and msg.lon == 0:
+                    if not had_zero_coords:
+                        mode_info = f" (Режим: {last_mode})" if last_mode else ""
+                        add_event("🚨 EKF 0.0.0.0", f"КРИТИЧНО: EKF скинув координати в нуль{mode_info}", current_time_ms, True)
+                        had_zero_coords = True
+                else:
+                    had_zero_coords = False
                     
             # --- ВІБРАЦІЇ ТА EKF ---
             elif msg_type == 'VIBRATION':
@@ -146,7 +170,7 @@ async def analyze(file: UploadFile = File(...)):
                 try:
                     txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
                     is_err = msg.severity <= 4
-                    add_event("⚠️ ПОМИЛКА" if is_err else "ℹ️ ІНФО", txt, t_ms, is_err)
+                    add_event("⚠️ ПОМИЛКА" if is_err else "ℹ️ ІНФО", txt, current_time_ms, is_err)
                 except: pass
 
         if min_voltage == 999.0: min_voltage = 0.0
