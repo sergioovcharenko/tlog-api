@@ -30,7 +30,15 @@ async def analyze(file: UploadFile = File(...)):
         max_speed = 0.0
         max_roll = 0.0
         max_pitch = 0.0
+        
+        # Зв'язок
         min_rssi = 255 
+        telem_rssi = None
+        telem_remrssi = None
+        
+        # Керування (PWM для CH1-CH4: Roll, Pitch, Throttle, Yaw)
+        rc_min = [9999, 9999, 9999, 9999]
+        rc_max = [0, 0, 0, 0]
         max_throttle = 0
         
         # Батарея 6S
@@ -48,17 +56,17 @@ async def analyze(file: UploadFile = File(...)):
         has_gps = False
         first_time_ms = None
         last_time_ms = None
-        current_time_ms = 0 # Глобальний трекер часу
+        current_time_ms = 0 
         
         # Стан польоту
         was_armed = False
         last_mode = None
         flight_modes = set()
         
-        # Детектор 0.0.0.0
-        had_zero_coords = False
+        # Детектори 0.0.0.0
+        gps_had_lock = False
+        ekf_had_origin = False
         
-        # Хронологія
         raw_timeline = []
 
         def add_event(title, text, time_ms, is_error=False):
@@ -76,7 +84,6 @@ async def analyze(file: UploadFile = File(...)):
             message_count += 1
             msg_type = msg.get_type()
             
-            # Оновлюємо глобальний час
             t_ms = getattr(msg, 'time_boot_ms', 0)
             if t_ms > 0:
                 current_time_ms = t_ms
@@ -124,31 +131,37 @@ async def analyze(file: UploadFile = File(...)):
                 if 0 < volt < min_voltage: min_voltage = volt
                 if curr > max_current: max_current = curr
                     
-            # --- ЗВ'ЯЗОК ТА GPS ---
+            # --- ЗВ'ЯЗОК, RC, TELEMETRY ---
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
+                
+                # Аналіз стіків керування (CH1-CH4)
+                chans = [msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw]
+                for i in range(4):
+                    if 500 < chans[i] < 2500: # Відкидаємо сміття, беремо тільки валідний PWM
+                        if chans[i] < rc_min[i]: rc_min[i] = chans[i]
+                        if chans[i] > rc_max[i]: rc_max[i] = chans[i]
+
+            elif msg_type in ['RADIO', 'RADIO_STATUS']:
+                telem_rssi = msg.rssi
+                telem_remrssi = msg.remrssi
                     
+            # --- GPS та 0.0.0.0 ---
             elif msg_type == 'GPS_RAW_INT':
                 if msg.satellites_visible > 0: has_gps = True
-                # Перевірка на нульові координати від самого GPS модуля
-                if msg.lat == 0 and msg.lon == 0:
-                    if not had_zero_coords:
-                        mode_info = f" (Режим: {last_mode})" if last_mode else ""
-                        add_event("🚨 0.0.0.0", f"КРИТИЧНО: GPS втратив позицію (0.0.0.0){mode_info}", current_time_ms, True)
-                        had_zero_coords = True
-                else:
-                    had_zero_coords = False
+                if msg.lat != 0 or msg.lon != 0:
+                    gps_had_lock = True
+                elif msg.lat == 0 and msg.lon == 0 and gps_had_lock:
+                    add_event("🚨 0.0.0.0", f"КРИТИЧНО: GPS втратив позицію (Режим: {last_mode})", current_time_ms, True)
+                    gps_had_lock = False
 
             elif msg_type == 'GLOBAL_POSITION_INT':
-                # Перевірка на нульові координати від EKF (глобальна оцінка позиції)
-                if msg.lat == 0 and msg.lon == 0:
-                    if not had_zero_coords:
-                        mode_info = f" (Режим: {last_mode})" if last_mode else ""
-                        add_event("🚨 EKF 0.0.0.0", f"КРИТИЧНО: EKF скинув координати в нуль{mode_info}", current_time_ms, True)
-                        had_zero_coords = True
-                else:
-                    had_zero_coords = False
+                if msg.lat != 0 or msg.lon != 0:
+                    ekf_had_origin = True
+                elif msg.lat == 0 and msg.lon == 0 and ekf_had_origin:
+                    add_event("🚨 EKF 0.0.0.0", f"КРИТИЧНО: EKF скинув координати в нуль (Режим: {last_mode})", current_time_ms, True)
+                    ekf_had_origin = False
                     
             # --- ВІБРАЦІЇ ТА EKF ---
             elif msg_type == 'VIBRATION':
@@ -183,7 +196,6 @@ async def analyze(file: UploadFile = File(...)):
             duration_sec = (last_time_ms - first_time_ms) // 1000
         mins, secs = divmod(duration_sec, 60)
         
-        # Форматуємо Хронологію
         timeline = []
         for ev in sorted(raw_timeline, key=lambda x: x['time_ms']):
             t_sec = (ev['time_ms'] - (first_time_ms or 0)) // 1000
@@ -197,6 +209,12 @@ async def analyze(file: UploadFile = File(...)):
 
         rssi_percent = round((min_rssi / 254.0) * 100) if min_rssi != 255 else 0
         modes_str = ", ".join(flight_modes) if flight_modes else "Невідомо"
+        
+        def format_rc(idx):
+            if rc_min[idx] == 9999: return "—"
+            # Якщо різниця менше 10, стік скоріше за все не чіпали
+            if rc_max[idx] - rc_min[idx] < 10: return f"{rc_min[idx]} (Не задіяний)"
+            return f"{rc_min[idx]} - {rc_max[idx]}"
 
         return {
             "success": True,
@@ -218,7 +236,13 @@ async def analyze(file: UploadFile = File(...)):
             "radio": {
                 "rssi": f"{rssi_percent}%" if min_rssi != 255 else "Немає",
                 "maxThrottle": f"{max_throttle}%",
-                "hasGps": "Присутній" if has_gps else "Без GPS"
+                "hasGps": "Присутній" if has_gps else "Без GPS",
+                "telemRssi": str(telem_rssi) if telem_rssi is not None else "—",
+                "telemRemRssi": str(telem_remrssi) if telem_remrssi is not None else "—",
+                "ch1": format_rc(0),
+                "ch2": format_rc(1),
+                "ch3": format_rc(2),
+                "ch4": format_rc(3)
             },
             "health": {
                 "vibX": round(max_vib_x, 1),
