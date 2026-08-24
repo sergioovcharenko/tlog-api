@@ -27,6 +27,7 @@ async def analyze(file: UploadFile = File(...)):
         message_count = 0
         max_alt = 0.0  
         start_alt = None 
+        need_alt_reset = True # Прапорець для скидання висоти при Армі
         max_speed = 0.0
         max_roll = 0.0
         max_pitch = 0.0
@@ -36,7 +37,7 @@ async def analyze(file: UploadFile = File(...)):
         telem_rssi = None
         telem_remrssi = None
         
-        # Керування (PWM для CH1-CH4: Roll, Pitch, Throttle, Yaw)
+        # Керування (PWM)
         rc_min = [9999, 9999, 9999, 9999]
         rc_max = [0, 0, 0, 0]
         max_throttle = 0
@@ -99,6 +100,8 @@ async def analyze(file: UploadFile = File(...)):
                     if is_armed and not was_armed:
                         add_event("🔴 ARMED", "Дрон озброєно (двигуни активні)", current_time_ms)
                         was_armed = True
+                        need_alt_reset = True # Скидаємо висоту в нуль при старті моторів
+                        
                     elif not is_armed and was_armed:
                         add_event("🟢 DISARMED", "Дрон знято з охорони", current_time_ms)
                         was_armed = False
@@ -109,11 +112,16 @@ async def analyze(file: UploadFile = File(...)):
                         flight_modes.add(current_mode)
                         last_mode = current_mode
 
-            # --- ПОЛІТ ---
+            # --- ПОЛІТ (Висота та швидкість) ---
             elif msg_type == 'VFR_HUD':
-                if start_alt is None: start_alt = msg.alt
+                # Фіксуємо нульову висоту тільки під час АРМУ (або при першому пакеті, якщо лог почався вже в польоті)
+                if need_alt_reset or start_alt is None:
+                    start_alt = msg.alt
+                    need_alt_reset = False
+                
                 rel_alt = msg.alt - start_alt
                 if rel_alt > max_alt: max_alt = rel_alt
+                
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
                     
@@ -136,10 +144,9 @@ async def analyze(file: UploadFile = File(...)):
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
                 
-                # Аналіз стіків керування (CH1-CH4)
                 chans = [msg.chan1_raw, msg.chan2_raw, msg.chan3_raw, msg.chan4_raw]
                 for i in range(4):
-                    if 500 < chans[i] < 2500: # Відкидаємо сміття, беремо тільки валідний PWM
+                    if 500 < chans[i] < 2500:
                         if chans[i] < rc_min[i]: rc_min[i] = chans[i]
                         if chans[i] > rc_max[i]: rc_max[i] = chans[i]
 
@@ -212,7 +219,6 @@ async def analyze(file: UploadFile = File(...)):
         
         def format_rc(idx):
             if rc_min[idx] == 9999: return "—"
-            # Якщо різниця менше 10, стік скоріше за все не чіпали
             if rc_max[idx] - rc_min[idx] < 10: return f"{rc_min[idx]} (Не задіяний)"
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
