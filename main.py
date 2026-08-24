@@ -2,16 +2,15 @@ from fastapi import FastAPI, UploadFile, File
 from pymavlink import mavutil
 import tempfile
 import os
+import math
 
 app = FastAPI()
 
 @app.get("/")
-def root():
-    return {"status": "ok"}
+def root(): return {"status": "ok"}
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+def health(): return {"status": "ok"}
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -24,123 +23,190 @@ async def analyze(file: UploadFile = File(...)):
 
         mav = mavutil.mavlink_connection(temp.name)
         
+        # Базові змінні
         message_count = 0
-        
-        # Висота та швидкість без GPS (за барометром/EKF)
         max_alt = 0.0  
         start_alt = None 
         max_speed = 0.0
+        max_roll = 0.0
+        max_pitch = 0.0
+        min_rssi = 255 
+        max_throttle = 0
         
+        # Батарея 6S
         min_voltage = 999.0
         max_current = 0.0
+        start_voltage = None 
+        
+        # Датчики та Вібрації
+        max_vib_x, max_vib_y, max_vib_z = 0.0, 0.0, 0.0
+        clip_count = 0
+        max_temp = -99.0
+        ekf_compass = 0.0
+        ekf_vel = 0.0
         
         has_gps = False
-        
         first_time_ms = None
         last_time_ms = None
         
-        autopilot_type = "ArduPilot"
+        # Стан польоту
+        was_armed = False
+        last_mode = None
+        flight_modes = set()
+        
+        # Хронологія
+        raw_timeline = []
+
+        def add_event(title, text, time_ms, is_error=False):
+            raw_timeline.append({
+                "time_ms": time_ms or 0,
+                "title": title,
+                "text": text,
+                "isError": is_error
+            })
 
         while True:
             msg = mav.recv_match(blocking=False)
-            if msg is None:
-                break
+            if msg is None: break
             
             message_count += 1
             msg_type = msg.get_type()
+            t_ms = getattr(msg, 'time_boot_ms', 0)
 
-            # Фіксуємо час у мілісекундах для тривалості польоту
-            if hasattr(msg, 'time_boot_ms'):
-                if first_time_ms is None:
-                    first_time_ms = msg.time_boot_ms
-                last_time_ms = msg.time_boot_ms
+            if t_ms > 0:
+                if first_time_ms is None: first_time_ms = t_ms
+                last_time_ms = t_ms
             
-            # 1. Політ (VFR_HUD працює від барометра, GPS не потрібен)
-            if msg_type == 'VFR_HUD':
-                # Запам'ятовуємо висоту при увімкненні (0 метрів для нас)
-                if start_alt is None:
-                    start_alt = msg.alt
+            # --- РЕЖИМИ ТА АРМІНГ ---
+            if msg_type == 'HEARTBEAT':
+                current_mode = mav.flightmode
+                is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                 
-                # Рахуємо відносну висоту
+                # Перевірка на Арм/Дизарм
+                if is_armed and not was_armed:
+                    add_event("🔴 ARMED", "Дрон озброєно (двигуни активні)", t_ms)
+                    was_armed = True
+                elif not is_armed and was_armed:
+                    add_event("🟢 DISARMED", "Дрон знято з охорони", t_ms)
+                    was_armed = False
+                    
+                # Перевірка зміни режиму
+                if current_mode and current_mode != last_mode:
+                    if last_mode is not None:
+                        add_event("🔄 РЕЖИМ", f"Зміна режиму: {last_mode} -> {current_mode}", t_ms)
+                    flight_modes.add(current_mode)
+                    last_mode = current_mode
+
+            # --- ПОЛІТ ---
+            elif msg_type == 'VFR_HUD':
+                if start_alt is None: start_alt = msg.alt
                 rel_alt = msg.alt - start_alt
-                if rel_alt > max_alt:
-                    max_alt = rel_alt
+                if rel_alt > max_alt: max_alt = rel_alt
+                if msg.groundspeed > max_speed: max_speed = msg.groundspeed
+                if msg.throttle > max_throttle: max_throttle = msg.throttle
                     
-                if msg.groundspeed > max_speed:
-                    max_speed = msg.groundspeed
+            elif msg_type == 'ATTITUDE':
+                r_deg = abs(math.degrees(msg.roll))
+                p_deg = abs(math.degrees(msg.pitch))
+                if r_deg > max_roll: max_roll = r_deg
+                if p_deg > max_pitch: max_pitch = p_deg
                     
-            # 2. Батарея
+            # --- ЖИВЛЕННЯ ---
             elif msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
                 curr = msg.current_battery / 100.0   
-                
-                if 0 < volt < min_voltage:
-                    min_voltage = volt
-                if curr > max_current:
-                    max_current = curr
+                if start_voltage is None and volt > 5.0: start_voltage = volt
+                if 0 < volt < min_voltage: min_voltage = volt
+                if curr > max_current: max_current = curr
                     
-            # 3. GPS (якщо раптом хтось підключить, скрипт це помітить)
+            # --- ЗВ'ЯЗОК ТА GPS ---
+            elif msg_type == 'RC_CHANNELS':
+                if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
+                    if msg.rssi < min_rssi: min_rssi = msg.rssi
             elif msg_type == 'GPS_RAW_INT':
-                if msg.satellites_visible > 0:
-                    has_gps = True
+                if msg.satellites_visible > 0: has_gps = True
+                    
+            # --- ВІБРАЦІЇ ТА EKF ---
+            elif msg_type == 'VIBRATION':
+                if msg.vibration_x > max_vib_x: max_vib_x = msg.vibration_x
+                if msg.vibration_y > max_vib_y: max_vib_y = msg.vibration_y
+                if msg.vibration_z > max_vib_z: max_vib_z = msg.vibration_z
+                clip_count = max(clip_count, msg.clipping_0, msg.clipping_1, msg.clipping_2)
+                
+            elif msg_type == 'EKF_STATUS_REPORT':
+                if msg.compass_variance > ekf_compass: ekf_compass = msg.compass_variance
+                if msg.velocity_variance > ekf_vel: ekf_vel = msg.velocity_variance
+                
+            elif msg_type == 'RAW_IMU':
+                temp_c = msg.temperature / 100.0
+                if temp_c > max_temp: max_temp = temp_c
+
+            # --- СИСТЕМНІ ПОВІДОМЛЕННЯ ---
+            elif msg_type == 'STATUSTEXT':
+                try:
+                    txt = msg.text.decode('utf-8') if isinstance(msg.text, bytes) else msg.text
+                    is_err = msg.severity <= 4
+                    add_event("⚠️ ПОМИЛКА" if is_err else "ℹ️ ІНФО", txt, t_ms, is_err)
+                except: pass
 
         if min_voltage == 999.0: min_voltage = 0.0
+        if start_voltage is None: start_voltage = 0.0
+        if max_temp == -99.0: max_temp = 0.0
 
-        # Точний час
+        # Час
         duration_sec = 0
         if first_time_ms and last_time_ms:
             duration_sec = (last_time_ms - first_time_ms) // 1000
-            
-        mins = duration_sec // 60
-        secs = duration_sec % 60
-        duration_text = f"{mins} хв {secs} с" if duration_sec > 0 else "Невідомо"
-
-        # AI Оцінка (більше не знімає бали за відсутність GPS)
-        score = 100
-        recommendations = []
+        mins, secs = divmod(duration_sec, 60)
         
-        # Приклад логіки для батареї (можна буде налаштувати під ваші збірки)
-        if 0 < min_voltage < 14.0: 
-            score -= 10
-            recommendations.append("Фіксувалась сильна просадка напруги (нижче 14V).")
+        # Форматуємо Хронологію
+        timeline = []
+        for ev in sorted(raw_timeline, key=lambda x: x['time_ms']):
+            t_sec = (ev['time_ms'] - (first_time_ms or 0)) // 1000
+            t_m, t_s = divmod(max(0, t_sec), 60)
+            timeline.append({
+                "time": f"{t_m:02d}:{t_s:02d}",
+                "title": ev['title'],
+                "text": ev['text'],
+                "isError": ev['isError']
+            })
 
-        summary = "Політ без GPS. Параметри в нормі." if score == 100 else "Виявлені відхилення по живленню."
+        rssi_percent = round((min_rssi / 254.0) * 100) if min_rssi != 255 else 0
+        modes_str = ", ".join(flight_modes) if flight_modes else "Невідомо"
 
         return {
             "success": True,
-            "ai": {
-                "score": score,
-                "summary": summary,
-                "recommendations": recommendations
-            },
             "flight": {
-                "durationText": duration_text,
-                "maxAltitude": round(max_alt, 2),
-                "maxSpeed": round(max_speed, 2),
-                "distanceKm": 0,
-                "autopilot": autopilot_type,
-                "firmware": f"Рядків: {message_count}"
+                "durationText": f"{mins} хв {secs} с",
+                "maxAltitude": round(max_alt, 1),
+                "maxSpeed": round(max_speed, 1),
+                "maxRoll": round(max_roll, 1),
+                "maxPitch": round(max_pitch, 1),
+                "modes": modes_str,
+                "msgCount": message_count
             },
             "battery": {
-                "armVoltage": 0,
+                "armVoltage": round(start_voltage, 2),
                 "minVoltage": round(min_voltage, 2),
                 "maxCurrent": round(max_current, 2),
-                "voltageSag": 0,
-                "statusText": "OK" if min_voltage >= 14.0 else "Увага: АКБ"
+                "voltageSag": round(max(0, start_voltage - min_voltage), 2)
             },
-            "gps": {
-                "satellitesMin": "—",
-                "satellitesMax": "—",
-                "maxHdop": "—",
-                "status": "NO_GPS",
-                "statusText": "Відсутній (Без GPS)" if not has_gps else "Присутній"
+            "radio": {
+                "rssi": f"{rssi_percent}%" if min_rssi != 255 else "Немає",
+                "maxThrottle": f"{max_throttle}%",
+                "hasGps": "Присутній" if has_gps else "Без GPS"
             },
-            "ekf": {}, "vibration": {}, "failsafe": {},
-            "timeline": []
+            "health": {
+                "vibX": round(max_vib_x, 1),
+                "vibY": round(max_vib_y, 1),
+                "vibZ": round(max_vib_z, 1),
+                "clipping": clip_count,
+                "maxTemp": round(max_temp, 1),
+                "ekfCompass": round(ekf_compass, 2)
+            },
+            "timeline": timeline
         }
 
     finally:
-        try:
-            os.unlink(temp.name)
-        except:
-            pass
+        try: os.unlink(temp.name)
+        except: pass
