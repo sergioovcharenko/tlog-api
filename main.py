@@ -7,7 +7,7 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "TLOG AI Analyzer"}
+    return {"status": "ok"}
 
 @app.get("/health")
 def health():
@@ -22,21 +22,24 @@ async def analyze(file: UploadFile = File(...)):
         temp.write(data)
         temp.close()
 
-        # Відкриваємо TLOG
         mav = mavutil.mavlink_connection(temp.name)
         
-        # Змінні для збору статистики
         message_count = 0
-        max_alt = 0.0
+        
+        # Висота та швидкість без GPS (за барометром/EKF)
+        max_alt = 0.0  
+        start_alt = None 
         max_speed = 0.0
+        
         min_voltage = 999.0
         max_current = 0.0
-        satellites_min = 99
-        satellites_max = 0
-        max_hdop = 0.0
         
-        autopilot_type = "Невідомо"
-        firmware_version = ""
+        has_gps = False
+        
+        first_time_ms = None
+        last_time_ms = None
+        
+        autopilot_type = "ArduPilot"
 
         while True:
             msg = mav.recv_match(blocking=False)
@@ -46,59 +49,63 @@ async def analyze(file: UploadFile = File(...)):
             message_count += 1
             msg_type = msg.get_type()
 
-            # 1. Автопілот та прошивка
-            if msg_type == 'AUTOPILOT_VERSION':
-                autopilot_type = "ArduPilot" if msg.flight_sw_version > 0 else "PX4 / Інше"
+            # Фіксуємо час у мілісекундах для тривалості польоту
+            if hasattr(msg, 'time_boot_ms'):
+                if first_time_ms is None:
+                    first_time_ms = msg.time_boot_ms
+                last_time_ms = msg.time_boot_ms
             
-            # 2. Політ (Висота та швидкість)
-            elif msg_type == 'VFR_HUD':
-                if msg.alt > max_alt:
-                    max_alt = msg.alt
+            # 1. Політ (VFR_HUD працює від барометра, GPS не потрібен)
+            if msg_type == 'VFR_HUD':
+                # Запам'ятовуємо висоту при увімкненні (0 метрів для нас)
+                if start_alt is None:
+                    start_alt = msg.alt
+                
+                # Рахуємо відносну висоту
+                rel_alt = msg.alt - start_alt
+                if rel_alt > max_alt:
+                    max_alt = rel_alt
+                    
                 if msg.groundspeed > max_speed:
                     max_speed = msg.groundspeed
                     
-            # 3. Батарея
+            # 2. Батарея
             elif msg_type == 'SYS_STATUS':
-                volt = msg.voltage_battery / 1000.0  # mV в V
-                curr = msg.current_battery / 100.0   # cA в A
+                volt = msg.voltage_battery / 1000.0  
+                curr = msg.current_battery / 100.0   
                 
-                if volt > 0 and volt < min_voltage:
+                if 0 < volt < min_voltage:
                     min_voltage = volt
                 if curr > max_current:
                     max_current = curr
                     
-            # 4. GPS
+            # 3. GPS (якщо раптом хтось підключить, скрипт це помітить)
             elif msg_type == 'GPS_RAW_INT':
-                sats = msg.satellites_visible
-                hdop = msg.eph / 100.0
-                
-                if sats < satellites_min and sats > 0:
-                    satellites_min = sats
-                if sats > satellites_max:
-                    satellites_max = sats
-                if hdop > max_hdop:
-                    max_hdop = hdop
+                if msg.satellites_visible > 0:
+                    has_gps = True
 
-        # Убезпечення від некоректних даних
-        if min_voltage == 999.0:
-            min_voltage = 0.0
-        if satellites_min == 99:
-            satellites_min = 0
+        if min_voltage == 999.0: min_voltage = 0.0
 
-        # AI Висновок (Базова логіка)
+        # Точний час
+        duration_sec = 0
+        if first_time_ms and last_time_ms:
+            duration_sec = (last_time_ms - first_time_ms) // 1000
+            
+        mins = duration_sec // 60
+        secs = duration_sec % 60
+        duration_text = f"{mins} хв {secs} с" if duration_sec > 0 else "Невідомо"
+
+        # AI Оцінка (більше не знімає бали за відсутність GPS)
         score = 100
         recommendations = []
         
-        if satellites_min < 10:
-            score -= 20
-            recommendations.append("Низька кількість супутників. Перевірте розташування GPS-модуля.")
-        if min_voltage < 14.0: # Умовно для 4S
+        # Приклад логіки для батареї (можна буде налаштувати під ваші збірки)
+        if 0 < min_voltage < 14.0: 
             score -= 10
-            recommendations.append("Напруга падала нижче критичної норми.")
-            
-        summary = "Політ пройшов у штатному режимі." if score > 80 else "Виявлено проблеми під час польоту, перевірте рекомендації."
+            recommendations.append("Фіксувалась сильна просадка напруги (нижче 14V).")
 
-        # Формуємо відповідь для HTML
+        summary = "Політ без GPS. Параметри в нормі." if score == 100 else "Виявлені відхилення по живленню."
+
         return {
             "success": True,
             "ai": {
@@ -107,36 +114,29 @@ async def analyze(file: UploadFile = File(...)):
                 "recommendations": recommendations
             },
             "flight": {
-                "durationText": f"~ {message_count // 50} сек", # Приблизно (залежить від частоти телеметрії)
+                "durationText": duration_text,
                 "maxAltitude": round(max_alt, 2),
                 "maxSpeed": round(max_speed, 2),
-                "distanceKm": 0, # Потребує складніших розрахунків координат
+                "distanceKm": 0,
                 "autopilot": autopilot_type,
-                "firmware": firmware_version
+                "firmware": f"Рядків: {message_count}"
             },
             "battery": {
                 "armVoltage": 0,
                 "minVoltage": round(min_voltage, 2),
                 "maxCurrent": round(max_current, 2),
                 "voltageSag": 0,
-                "statusText": "OK" if min_voltage > 14.0 else "Критичний розряд"
+                "statusText": "OK" if min_voltage >= 14.0 else "Увага: АКБ"
             },
             "gps": {
-                "satellitesMin": satellites_min,
-                "satellitesMax": satellites_max,
-                "maxHdop": round(max_hdop, 2),
-                "status": "OK" if max_hdop < 2.0 else "WARNING",
-                "statusText": "Чудовий прийом" if satellites_min > 12 else "Слабкий сигнал"
+                "satellitesMin": "—",
+                "satellitesMax": "—",
+                "maxHdop": "—",
+                "status": "NO_GPS",
+                "statusText": "Відсутній (Без GPS)" if not has_gps else "Присутній"
             },
-            "ekf": {},
-            "vibration": {},
-            "failsafe": {},
-            "timeline": [
-                {"time": "00:00", "title": "TLOG", "text": f"Прочитано {message_count} повідомлень"}
-            ],
-            "debug": {
-                "message_count": message_count
-            }
+            "ekf": {}, "vibration": {}, "failsafe": {},
+            "timeline": []
         }
 
     finally:
