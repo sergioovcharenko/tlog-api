@@ -9,13 +9,10 @@ app = FastAPI()
 def parse_dbm(raw_val):
     if raw_val is None or raw_val == 0:
         return 0
-    # Якщо прийшло від'ємне значення
     if raw_val < 0:
         return raw_val
-    # Якщо прийшов uint8 (наприклад 216 -> 216 - 256 = -40 dBm)
     if raw_val > 127:
         return raw_val - 256
-    # Якщо прийшов SiK raw RSSI (0-100)
     if 0 < raw_val <= 100:
         return round(raw_val / 1.9 - 127)
     return -raw_val
@@ -40,11 +37,14 @@ async def analyze(file: UploadFile = File(...)):
         # Базові змінні
         message_count = 0
         max_alt = 0.0  
-        start_alt = None 
-        need_alt_reset = True
         max_speed = 0.0
         max_roll = 0.0
         max_pitch = 0.0
+        
+        # Розрахунок висоти (Динамічний нуль землі)
+        latest_baro_alt = 0.0
+        ground_baro_alt = None
+        is_currently_armed = False
         
         # Поточні параметри для хронології
         curr_alt = 0.0
@@ -104,10 +104,14 @@ async def analyze(file: UploadFile = File(...)):
         raw_timeline = []
 
         def add_event(text, t_stamp, mode, is_error=False):
+            # Обчислюємо висоту від замороженої точки землі
+            alt_calc = max(0.0, latest_baro_alt - (ground_baro_alt if ground_baro_alt is not None else latest_baro_alt))
+            display_alt = curr_alt if curr_alt > 0 else alt_calc
+            
             raw_timeline.append({
                 "timestamp": t_stamp or 0,
                 "mode": mode,
-                "alt": f"{round(curr_alt, 1)} м",
+                "alt": f"{round(display_alt, 1)} м",
                 "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
                 "volt": round(curr_voltage, 1) if curr_voltage > 0 else "—",
                 "curr": f"{round(curr_amp, 1)} А" if curr_amp > 0 else "0.0 А",
@@ -130,15 +134,40 @@ async def analyze(file: UploadFile = File(...)):
                 if first_timestamp is None: 
                     first_timestamp = t_stamp
 
-            # --- ЖИВЛЕННЯ & ПЕРЕПІДКТЮЧЕННЯ ---
-            if msg_type == 'SYS_STATUS':
+            # --- 1. СТАН ДВИГУНІВ ТА РЕЖИМИ ---
+            if msg_type == 'HEARTBEAT':
+                if msg.get_srcComponent() == 1:
+                    new_mode = mav.flightmode
+                    is_armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    is_currently_armed = is_armed
+                    
+                    if new_mode and new_mode != current_mode:
+                        if current_mode != "Невідомо":
+                            add_event(f"🔄 Режим змінено на {new_mode}", current_timestamp, new_mode)
+                        current_mode = new_mode
+                        flight_modes.add(current_mode)
+                        if current_mode == "LAND":
+                            land_mode_triggered = True
+                    
+                    if is_armed and not was_armed:
+                        # Фіксуємо земну висоту строго в момент запуску
+                        if latest_baro_alt > 0:
+                            ground_baro_alt = latest_baro_alt
+                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
+                        was_armed = True
+                    elif not is_armed and was_armed:
+                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
+                        was_armed = False
+
+            # --- 2. ЖИВЛЕННЯ & ПЕРЕПІДКТЮЧЕННЯ ---
+            elif msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
                 curr = msg.current_battery / 100.0   
                 
                 if volt > 5.0:
                     if curr_voltage > 5.0 and curr_voltage < 22.0 and volt > 24.5:
                         reboot_or_second_battery = True
-                        need_alt_reset = True
+                        ground_baro_alt = latest_baro_alt
                         add_event("🔋 Заміна батареї / Новий політ", current_timestamp, current_mode)
                     
                     curr_voltage = volt
@@ -159,20 +188,29 @@ async def analyze(file: UploadFile = File(...)):
                         if vnav_val < vnav_quality_min_loiter: vnav_quality_min_loiter = vnav_val
                         if vnav_val > vnav_quality_max_loiter: vnav_quality_max_loiter = vnav_val
 
-            # --- ВИСОТА ТА ДАЛЬНІСТЬ ---
+            # --- 3. РОЗРАХУНОК ВИСОТИ ТА ДАЛЬНОСТІ ---
             elif msg_type == 'VFR_HUD':
-                if start_alt is None or need_alt_reset:
-                    start_alt = msg.alt
-                    need_alt_reset = False
+                latest_baro_alt = msg.alt
                 
-                calculated_alt = msg.alt - start_alt
-                curr_alt = max(0.0, calculated_alt)
+                # Поки дрон на землі, постійно оновлюємо нуль
+                if not is_currently_armed or ground_baro_alt is None:
+                    ground_baro_alt = msg.alt
+
+                rel_baro_alt = max(0.0, latest_baro_alt - ground_baro_alt)
+                curr_alt = rel_baro_alt
                 
-                if curr_alt > max_alt and curr_alt < 500.0:
+                if curr_alt > max_alt and curr_alt < 1000.0:
                     max_alt = curr_alt
                 
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
+
+            elif msg_type == 'ALTITUDE':
+                if hasattr(msg, 'altitude_relative') and not math.isnan(msg.altitude_relative):
+                    if msg.altitude_relative >= 0:
+                        curr_alt = msg.altitude_relative
+                        if curr_alt > max_alt and curr_alt < 1000.0:
+                            max_alt = curr_alt
 
             elif msg_type in ['LOCAL_POSITION_NED', 'POSITION_TARGET_LOCAL_NED']:
                 x = getattr(msg, 'x', 0.0)
@@ -194,7 +232,7 @@ async def analyze(file: UploadFile = File(...)):
                     if rf_dist > max_rf_alt: 
                         max_rf_alt = rf_dist
 
-            # --- ЗВ'ЯЗОК & RC (КОРЕКТНИЙ ДЕКОД DBM) ---
+            # --- 4. ЗВ'ЯЗОК & RC ---
             elif msg_type == 'RC_CHANNELS':
                 if hasattr(msg, 'rssi') and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi: min_rssi = msg.rssi
@@ -227,28 +265,6 @@ async def analyze(file: UploadFile = File(...)):
                 if min_dbm == 0 or dbm_val < min_dbm:
                     min_dbm = dbm_val
 
-            # --- РЕЖИМИ ТА АРМІНГ ---
-            elif msg_type == 'HEARTBEAT':
-                if msg.get_srcComponent() == 1:
-                    new_mode = mav.flightmode
-                    is_armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                    
-                    if new_mode and new_mode != current_mode:
-                        if current_mode != "Невідомо":
-                            add_event(f"🔄 Режим змінено на {new_mode}", current_timestamp, new_mode)
-                        current_mode = new_mode
-                        flight_modes.add(current_mode)
-                        if current_mode == "LAND":
-                            land_mode_triggered = True
-                    
-                    if is_armed and not was_armed:
-                        add_event("🔴 Двигуни запущено", current_timestamp, current_mode)
-                        was_armed = True
-                        need_alt_reset = True
-                    elif not is_armed and was_armed:
-                        add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
-                        was_armed = False
-
             elif msg_type == 'ATTITUDE':
                 r_deg = abs(math.degrees(msg.roll))
                 p_deg = abs(math.degrees(msg.pitch))
@@ -256,6 +272,10 @@ async def analyze(file: UploadFile = File(...)):
                 if p_deg > max_pitch: max_pitch = p_deg
 
             elif msg_type == 'GLOBAL_POSITION_INT':
+                if hasattr(msg, 'relative_alt') and msg.relative_alt != 0:
+                    rel_g = msg.relative_alt / 1000.0
+                    if rel_g >= 0:
+                        curr_alt = rel_g
                 if current_mode == 'LOITER':
                     if msg.lat != 0 or msg.lon != 0:
                         loiter_has_origin = True
@@ -339,7 +359,6 @@ async def analyze(file: UploadFile = File(...)):
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V.")
 
-        # Точна оцінка за вашими порогами
         if min_dbm <= -128 or (telem_rssi_raw == 0 and telem_remrssi_raw == 0):
             ai_alerts.append("📡 <b>-128 dBm: Втрата відео та телеметрії.</b> Повний розрив каналу зв'язку.")
             is_critical = True
