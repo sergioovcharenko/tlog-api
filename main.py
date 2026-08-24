@@ -42,7 +42,7 @@ async def analyze(file: UploadFile = File(...)):
         max_speed = 0.0
         max_roll = 0.0
         max_pitch = 0.0
-        max_dist = 0.0  # ✅ Виправлено: ініціалізація max_dist
+        max_dist = 0.0
 
         # Altitude State
         latest_baro_alt = None
@@ -106,6 +106,8 @@ async def analyze(file: UploadFile = File(...)):
         current_mode = "Невідомо"
         flight_modes = set()
         land_mode_triggered = False
+        
+        # Спільна хронологія
         raw_timeline = []
 
         def update_flight_altitude(new_alt, timestamp=None):
@@ -143,17 +145,18 @@ async def analyze(file: UploadFile = File(...)):
             if curr_alt > max_alt:
                 max_alt = curr_alt
 
-        def add_event(text, t_stamp, mode, is_error=False):
+        def add_event(text, t_stamp, mode, is_error=False, is_pilot_action=False):
             raw_timeline.append({
                 "timestamp": t_stamp or 0,
                 "mode": mode,
                 "alt": f"{round(curr_alt, 1)} м",
                 "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
-                "volt": round(curr_voltage, 1) if curr_voltage > 0 else "—",
+                "volt": round(curr_voltage, 2) if curr_voltage > 0 else "—",
                 "curr": f"{round(curr_amp, 1)} А" if curr_amp > 0 else "0.0 А",
                 "rssi": f"{curr_rssi_pct}%" if curr_rssi_pct > 0 else "—",
                 "dbm": f"{round(curr_dbm)} dBm" if curr_dbm != 0 else "—",
-                "text": text,
+                "system_text": "" if is_pilot_action else text,
+                "pilot_text": text if is_pilot_action else "",
                 "isError": is_error
             })
 
@@ -283,7 +286,7 @@ async def analyze(file: UploadFile = File(...)):
                     if rf_dist > max_rf_alt:
                         max_rf_alt = rf_dist
 
-            # 7. RC_CHANNELS
+            # 7. RC_CHANNELS (Дія пілота)
             elif msg_type == "RC_CHANNELS":
                 if hasattr(msg, "rssi") and 0 < msg.rssi < 255:
                     if msg.rssi < min_rssi:
@@ -308,7 +311,7 @@ async def analyze(file: UploadFile = File(...)):
                             prev = last_rc_state[ch_num]
                             if prev > 0 and abs(val - prev) > 250:
                                 state_str = "АКТИВНО" if val > 1600 else ("СЕРЕДНЄ" if 1300 <= val <= 1600 else "ВИМК")
-                                add_event(f"🎮 CH{ch_num} переведено в {state_str} ({val} us)", current_timestamp, current_mode)
+                                add_event(f"🎮 CH{ch_num} переведено в {state_str} ({val} us)", current_timestamp, current_mode, is_pilot_action=True)
                             last_rc_state[ch_num] = val
 
             # 8. RADIO
@@ -353,7 +356,35 @@ async def analyze(file: UploadFile = File(...)):
                 max_vib_z = max(max_vib_z, msg.vibration_z)
                 clip_count = max(clip_count, msg.clipping_0, msg.clipping_1, msg.clipping_2)
 
-            # 12. STATUSTEXT
+            # 12. ТЕМПЕРАТУРА ПОЛЬОТНОГО КОНТРОЛЕРА Temperature(1) / IMU / MCU
+            elif msg_type == "TEMPERATURE":
+                if hasattr(msg, "temperature") and msg.temperature != 0:
+                    t_val = msg.temperature / 100.0 if abs(msg.temperature) > 150 else float(msg.temperature)
+                    if -50 < t_val < 150:
+                        if max_temp == -99.0 or t_val > max_temp:
+                            max_temp = t_val
+
+            elif msg_type == "HIGHRES_IMU":
+                if hasattr(msg, "temperature") and msg.temperature > -50:
+                    t_val = float(msg.temperature)
+                    if max_temp == -99.0 or t_val > max_temp:
+                        max_temp = t_val
+
+            elif msg_type in ["SCALED_PRESSURE", "SCALED_PRESSURE2", "SCALED_PRESSURE3"]:
+                if hasattr(msg, "temperature") and msg.temperature != 0:
+                    t_deg = msg.temperature / 100.0
+                    if -50 < t_deg < 150:
+                        if max_temp == -99.0 or t_deg > max_temp:
+                            max_temp = t_deg
+
+            elif msg_type == "MCU_STATUS":
+                if hasattr(msg, "mcu_temperature") and msg.mcu_temperature != 0:
+                    t_deg = msg.mcu_temperature / 100.0
+                    if -50 < t_deg < 150:
+                        if max_temp == -99.0 or t_deg > max_temp:
+                            max_temp = t_deg
+
+            # 13. STATUSTEXT
             elif msg_type == "STATUSTEXT":
                 try:
                     txt = msg.text.decode("utf-8") if isinstance(msg.text, bytes) else msg.text
@@ -374,6 +405,7 @@ async def analyze(file: UploadFile = File(...)):
         if vnav_quality_min_loiter == 999:
             vnav_quality_min_loiter = 0
 
+        final_max_altitude = max_rf_alt if (has_rangefinder and max_rf_alt > 0 and not rangefinder_failed_flag) else max_alt
         duration_sec = max(0, int(current_timestamp - first_timestamp)) if (first_timestamp and current_timestamp) else 0
         mins, secs = divmod(duration_sec, 60)
 
@@ -392,12 +424,14 @@ async def analyze(file: UploadFile = File(...)):
                 "curr": ev["curr"],
                 "rssi": ev["rssi"],
                 "dbm": ev["dbm"],
-                "text": ev["text"],
+                "systemText": ev["system_text"],
+                "pilotText": ev["pilot_text"],
                 "isError": ev["isError"]
             })
 
         rssi_percent = round((min_rssi / 254.0) * 100) if min_rssi != 255 else 0
         modes_str = ", ".join(flight_modes) if flight_modes else "Невідомо"
+        display_temp = f"{round(max_temp, 1)} °C" if max_temp != -99.0 else "Немає даних"
 
         # AI Verdict and Alerts
         ai_alerts = []
@@ -441,6 +475,9 @@ async def analyze(file: UploadFile = File(...)):
         elif min_dbm < 0:
             ai_alerts.append(f"✅ <b>Рівень відео та телеметрії в нормі:</b> Мінімальний сигнал {round(min_dbm)} dBm.")
 
+        if max_current > 80.0:
+            ai_alerts.append(f"⚡️ <b>Перевищення струму:</b> Максимальне споживання досягало {round(max_current, 1)} A (>80A).")
+
         if was_armed:
             ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах.")
             is_critical = True
@@ -465,7 +502,7 @@ async def analyze(file: UploadFile = File(...)):
             },
             "flight": {
                 "durationText": f"{mins} хв {secs} с",
-                "maxAltitude": round(max_alt, 1),
+                "maxAltitude": round(final_max_altitude, 1),
                 "maxSpeed": round(max_speed, 1),
                 "maxRoll": round(max_roll, 1),
                 "maxPitch": round(max_pitch, 1),
@@ -490,17 +527,11 @@ async def analyze(file: UploadFile = File(...)):
                 "vibY": round(max_vib_y, 1),
                 "vibZ": round(max_vib_z, 1),
                 "clipping": clip_count,
-                "maxTemp": round(max_temp, 1),
+                "maxTemp": display_temp,
                 "engineLoadLoiter": (
                     f"{round(vnav_quality_min_loiter)}% – {round(vnav_quality_max_loiter)}%"
                     if vnav_samples > 0 else "Немає даних"
                 )
-            },
-            "rangefinder": {
-                "available": has_rangefinder,
-                "current": round(rangefinder_alt, 1) if rangefinder_alt is not None else None,
-                "max": round(max_rf_alt, 1),
-                "failed": rangefinder_failed_flag
             },
             "timeline": timeline
         }
