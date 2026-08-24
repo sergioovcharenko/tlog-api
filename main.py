@@ -49,23 +49,21 @@ async def analyze(file: UploadFile = File(...)):
         start_voltage = None 
         voltage_at_land_mode = None
         
-        # Датчики, Вібрації, Навантаження
+        # Датчики та Вібрації
         max_vib_x, max_vib_y, max_vib_z = 0.0, 0.0, 0.0
         clip_count = 0
         max_temp = -99.0
         ekf_compass = 0.0
         ekf_vel = 0.0
         
-        # Оптична навігація (Optical Flow)
-        opt_flow_quality_min = 255
-        opt_flow_detected = False
+        # Оптична навігація (Якість оптичного модуля в Loiter на 50-200м)
+        vnav_quality_min_loiter = 999
+        vnav_quality_max_loiter = 0
+        vnav_samples = 0
         loiter_has_origin = False
         loiter_origin_failed = False
         
-        # Engine Load у режимі Loiter на висотах 50-200м
-        engine_load_loiter_max = 0
-        engine_load_samples = 0
-        
+        has_gps = False
         first_timestamp = None
         current_timestamp = 0.0 
         
@@ -120,7 +118,7 @@ async def analyze(file: UploadFile = File(...)):
                         add_event("🟢 Двигуни зупинено", current_timestamp, current_mode)
                         was_armed = False
 
-            # --- ПОЛІТ & LOITER ---
+            # --- ПОЛІТ & АНАЛІЗ ЯКОСТІ ОПТИКИ В LOITER ---
             elif msg_type == 'VFR_HUD':
                 if need_alt_reset or start_alt is None:
                     start_alt = msg.alt
@@ -130,12 +128,6 @@ async def analyze(file: UploadFile = File(...)):
                 if rel_alt > max_alt: max_alt = rel_alt
                 if msg.groundspeed > max_speed: max_speed = msg.groundspeed
                 if msg.throttle > max_throttle: max_throttle = msg.throttle
-                
-                # Аналіз навантаження двигунів у LOITER на висоті 50-200м
-                if current_mode == 'LOITER' and 50.0 <= rel_alt <= 200.0:
-                    engine_load_samples += 1
-                    if msg.throttle > engine_load_loiter_max:
-                        engine_load_loiter_max = msg.throttle
                     
             elif msg_type == 'ATTITUDE':
                 r_deg = abs(math.degrees(msg.roll))
@@ -143,7 +135,7 @@ async def analyze(file: UploadFile = File(...)):
                 if r_deg > max_roll: max_roll = r_deg
                 if p_deg > max_pitch: max_pitch = p_deg
                     
-            # --- ЖИВЛЕННЯ (6S: 25.2V -> 16.8V) ---
+            # --- ЖИВЛЕННЯ (6S: 25.2V -> 16.8V) ТА ЯКІСТЬ ОПТИЧНОЇ НАВІГАЦІЇ ---
             elif msg_type == 'SYS_STATUS':
                 volt = msg.voltage_battery / 1000.0  
                 curr = msg.current_battery / 100.0   
@@ -154,10 +146,15 @@ async def analyze(file: UploadFile = File(...)):
                 if current_mode == 'LAND' and voltage_at_land_mode is None:
                     voltage_at_land_mode = volt
 
+                # Беремо Engine Load як показник якості роботи оптичного модуля у Loiter (50-200м)
                 if current_mode == 'LOITER':
-                    sys_load = getattr(msg, 'load', 0) / 10.0
-                    if sys_load > engine_load_loiter_max:
-                        engine_load_loiter_max = sys_load
+                    rel_alt_now = max_alt # або точна висота з VFR_HUD
+                    if 50.0 <= rel_alt_now <= 200.0:
+                        vnav_val = getattr(msg, 'load', 0) / 10.0 # Отримуємо якість у %
+                        if vnav_val > 0:
+                            vnav_samples += 1
+                            if vnav_val < vnav_quality_min_loiter: vnav_quality_min_loiter = vnav_val
+                            if vnav_val > vnav_quality_max_loiter: vnav_quality_max_loiter = vnav_val
                     
             # --- ЗВ'ЯЗОК, RC, TELEMETRY (dBm) ---
             elif msg_type == 'RC_CHANNELS':
@@ -176,15 +173,8 @@ async def analyze(file: UploadFile = File(...)):
                 if min_dbm == 0 or dbm_val < min_dbm:
                     min_dbm = dbm_val
 
-            # --- ОПТИЧНА НАВІГАЦІЯ ТА ВІДБИТТЯ В LOITER ---
-            elif msg_type == 'OPTICAL_FLOW':
-                opt_flow_detected = True
-                if hasattr(msg, 'quality'):
-                    if msg.quality < opt_flow_quality_min:
-                        opt_flow_quality_min = msg.quality
-
+            # --- ВІДБИТТЯ ТОЧКИ 0,0,0,0 В LOITER ---
             elif msg_type == 'GLOBAL_POSITION_INT':
-                # У режимі LOITER перевіряємо, чи відбилися координати від оптичної системи
                 if current_mode == 'LOITER':
                     if msg.lat != 0 or msg.lon != 0:
                         loiter_has_origin = True
@@ -209,6 +199,7 @@ async def analyze(file: UploadFile = File(...)):
         # Завершення
         if min_voltage == 999.0: min_voltage = 0.0
         if start_voltage is None: start_voltage = 0.0
+        if vnav_quality_min_loiter == 999: vnav_quality_min_loiter = 0
 
         duration_sec = int(current_timestamp - first_timestamp) if first_timestamp and current_timestamp else 0
         mins, secs = divmod(duration_sec, 60)
@@ -233,20 +224,24 @@ async def analyze(file: UploadFile = File(...)):
             return f"{rc_min[idx]} - {rc_max[idx]}"
 
         # ==========================================
-        # 🤖 AI ВИСНОВОК: ОПТИЧНА НАВІГАЦІЯ + 6S + LOITER
+        # 🤖 AI ВИСНОВОК: ЯКІСТЬ ОПТИКИ + 6S + LOITER
         # ==========================================
         ai_alerts = []
         is_critical = False
 
-        # 1. Оптична навігація в LOITER
+        # 1. Аналіз роботи та якості Оптичної Навігації в LOITER (50-200м)
         if 'LOITER' in flight_modes:
             if loiter_origin_failed and not loiter_has_origin:
-                ai_alerts.append("👁 <b>Збій утриманні Loiter:</b> Оптична навігація не змогла відбити координати (0.0.0.0). Перевірте контрастність поверхні або робочу висоту датчика.")
+                ai_alerts.append("👁 <b>Збій оптичного захоплення в Loiter:</b> Модуль не змог відбити точку 0.0.0.0.")
+                is_critical = True
             elif loiter_has_origin:
-                ai_alerts.append("✅ <b>Оптична навігація у Loiter:</b> Точка утримання успішно зафіксована від оптичної системи.")
+                ai_alerts.append("✅ <b>Оптична навігація в Loiter:</b> Точку 0.0.0.0 успішно зафіксовано оптикою.")
 
-            if opt_flow_detected and opt_flow_quality_min < 40:
-                ai_alerts.append(f"⚠️ <b>Низька якість оптичного потоку:</b> Мінімальна якість зображення падала до {opt_flow_quality_min}/255. Можливий дрейф у Loiter.")
+            if vnav_samples > 0:
+                if vnav_quality_min_loiter < 40:
+                    ai_alerts.append(f"⚠️ <b>Низька якість Оптичної Навігації:</b> На висоті 50-200м якість розпізнавання падала до {round(vnav_quality_min_loiter)}%. Високий ризик дрейфу або зриву точки.")
+                else:
+                    ai_alerts.append(f"👁 <b>Якість Оптичної Навігації (Loiter 50-200м):</b> Працювала стабільно на рівні {round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%.")
 
         # 2. Живлення 6S (25.2V -> 16.8V LAND)
         if 0 < min_voltage <= 16.8:
@@ -254,7 +249,7 @@ async def analyze(file: UploadFile = File(...)):
             if land_mode_triggered:
                 ai_alerts.append(f"🪫 <b>Посадка за розрядом:</b> Напруга впала до {round(min_voltage,1)}V (поріг 16.8V). Автопілот примусово перевів борт у режим LAND.")
             else:
-                ai_alerts.append(f"🚨 <b>Критичний розряд без LAND:</b> Напруга просіла до {round(min_voltage,1)}V (нижче 16.8V), але режим LAND не встиг відпрацювати. Можливе падіння через знеструмлення.")
+                ai_alerts.append(f"🚨 <b>Критичний розряд без LAND:</b> Напруга просіла до {round(min_voltage,1)}V (нижче 16.8V), але режим LAND не встиг відпрацювати.")
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(f"🔋 <b>Глибока просадка:</b> Напруга падала до {round(min_voltage,1)}V (межа посадки 16.8V).")
 
@@ -263,20 +258,13 @@ async def analyze(file: UploadFile = File(...)):
             ai_alerts.append("📡 <b>-128 dBm: Повна втрата зв'язку:</b> Відсутній сигнал відео та телеметрії.")
             is_critical = True
         elif -100 <= min_dbm < -90:
-            ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу.</b> Телеметрія залишалась присутньою, але відеоканал був повністю втрачений.")
+            ai_alerts.append(f"📡 <b>{round(min_dbm)} dBm: Втрата відеосигналу.</b> Телеметрія залишалась присутньою, але відеоканал був втрачений.")
         elif -90 <= min_dbm < -85:
-            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b> Граничний рівень сигналу, спостерігалися перешкоди та артефакти зображення.")
+            ai_alerts.append(f"📶 <b>{round(min_dbm)} dBm: Підсипання відео.</b> Граничний рівень сигналу, спостерігалися перешкоди.")
         elif min_dbm < 0 and min_dbm >= -85:
             ai_alerts.append(f"✅ <b>Рівень сигналу в нормі:</b> Рівень dBm не опускався нижче {round(min_dbm)} dBm.")
 
-        # 4. Engine Load у LOITER (50-200м)
-        if engine_load_samples > 0:
-            if engine_load_loiter_max > 85:
-                ai_alerts.append(f"⚠️ <b>Перевантаження двигунів у Loiter:</b> На висотах 50-200м Engine Load досягав {round(engine_load_loiter_max)}%. Борт працює на межі потужності.")
-            else:
-                ai_alerts.append(f"⚙️ <b>Engine Load у Loiter:</b> На висоті 50-200м навантаження двигунів склало до {round(engine_load_loiter_max)}% (норма).")
-
-        # 5. Обрив логу та нахили
+        # 4. Обрив логу та нахили
         if was_armed:
             ai_alerts.append("❗️ <b>Обрив логу під навантаженням:</b> Файл закінчився при працюючих двигунах. Ознака фізичного знищення або влучання.")
             is_critical = True
@@ -331,7 +319,7 @@ async def analyze(file: UploadFile = File(...)):
                 "vibZ": round(max_vib_z, 1),
                 "clipping": clip_count,
                 "maxTemp": round(max_temp, 1),
-                "engineLoadLoiter": f"{round(engine_load_loiter_max)}%" if engine_load_samples > 0 else "Немає даних"
+                "engineLoadLoiter": f"{round(vnav_quality_min_loiter)}% – {round(vnav_quality_max_loiter)}%" if vnav_samples > 0 else "Немає даних"
             },
             "timeline": timeline
         }
