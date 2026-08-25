@@ -1150,36 +1150,63 @@ async def analyze(file: UploadFile = File(...)):
         # ====================================================
         # PRIMARY FALSE NED SELECTION
         # ====================================================
-        # The first false coordinates are expected around the FIRST LOITER.
-        # They may be mixed positive/negative values, approximately
-        # from -0.9 to +0.9 m on N/E/D.
+        # ВАЖЛИВО:
+        # первинні хибні координати не обов'язково рівні 0.0,0.0,0.0.
+        # Допускаємо змішані значення в межах приблизно -0.9 ... +0.9 м.
+        #
+        # Головний критерій за фактичними логами:
+        # беремо ПЕРШИЙ малий "initial pos NED", який реально записаний
+        # у LOITER. Не прив'язуємо його до жорсткого вікна 5/15/60 секунд,
+        # бо STATUSTEXT може з'явитися пізніше від самого HEARTBEAT/зміни режиму.
 
         primary_false_ned_detected = False
         primary_false_ned_coords = None
         primary_false_ned_timestamp = None
         primary_false_ned_text = None
 
-        if first_loiter_timestamp is not None:
-            small_candidates = [
-                item
-                for item in ned_initializations
-                if item["isSmallPrimaryCandidate"]
-            ]
+        small_candidates = [
+            item
+            for item in ned_initializations
+            if item["isSmallPrimaryCandidate"]
+        ]
 
-            nearby = [
+        # 1) Найнадійніше: сам STATUSTEXT був отриманий, коли поточний режим LOITER.
+        small_in_loiter = [
+            item
+            for item in small_candidates
+            if str(item.get("mode", "")).upper() == "LOITER"
+        ]
+
+        if small_in_loiter:
+            selected = min(
+                small_in_loiter,
+                key=lambda item: (
+                    item["timestamp"]
+                    if item["timestamp"] is not None
+                    else float("inf")
+                ),
+            )
+
+            primary_false_ned_detected = True
+            primary_false_ned_coords = selected["coords"]
+            primary_false_ned_timestamp = selected["timestamp"]
+            primary_false_ned_text = selected["text"]
+
+        # 2) Fallback: якщо STATUSTEXT прийшов буквально біля першого LOITER,
+        # але поле mode ще не встигло оновитися через порядок MAVLink-пакетів.
+        elif first_loiter_timestamp is not None and small_candidates:
+            around_first_loiter = [
                 item
                 for item in small_candidates
                 if (
                     item["timestamp"] is not None
-                    and first_loiter_timestamp - 5.0
-                    <= item["timestamp"]
-                    <= first_loiter_timestamp + 15.0
+                    and abs(item["timestamp"] - first_loiter_timestamp) <= 120.0
                 )
             ]
 
-            if nearby:
+            if around_first_loiter:
                 selected = min(
-                    nearby,
+                    around_first_loiter,
                     key=lambda item: abs(
                         item["timestamp"] - first_loiter_timestamp
                     ),
@@ -1190,30 +1217,16 @@ async def analyze(file: UploadFile = File(...)):
                 primary_false_ned_timestamp = selected["timestamp"]
                 primary_false_ned_text = selected["text"]
 
-            elif small_candidates:
-                close_candidates = [
-                    item
-                    for item in small_candidates
-                    if (
-                        item["timestamp"] is not None
-                        and abs(
-                            item["timestamp"] - first_loiter_timestamp
-                        ) <= 60.0
-                    )
-                ]
+        # 3) Останній fallback:
+        # якщо у логові є тільки один малий initial pos NED, не ігноруємо його.
+        # Це захищає від ситуацій, коли mode у STATUSTEXT ще "Невідомо".
+        elif len(small_candidates) == 1:
+            selected = small_candidates[0]
 
-                if close_candidates:
-                    selected = min(
-                        close_candidates,
-                        key=lambda item: abs(
-                            item["timestamp"] - first_loiter_timestamp
-                        ),
-                    )
-
-                    primary_false_ned_detected = True
-                    primary_false_ned_coords = selected["coords"]
-                    primary_false_ned_timestamp = selected["timestamp"]
-                    primary_false_ned_text = selected["text"]
+            primary_false_ned_detected = True
+            primary_false_ned_coords = selected["coords"]
+            primary_false_ned_timestamp = selected["timestamp"]
+            primary_false_ned_text = selected["text"]
 
         # Compatibility fields used by the existing HTML/API.
         optical_zero_detected = primary_false_ned_detected
@@ -1389,7 +1402,7 @@ async def analyze(file: UploadFile = File(...)):
                     "⚠️ <b>Первинні хибні координати не зафіксовано:</b> "
                     "у TLOG не знайдено малого initial pos NED "
                     "приблизно в межах -0.9…+0.9 м по N/E/D "
-                    "біля першого переходу в LOITER."
+                    "для первинної роботи LOITER."
                 )
 
         elif ever_armed:
