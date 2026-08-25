@@ -604,7 +604,9 @@ async def analyze(file: UploadFile = File(...)):
                     latest_baro_alt - ground_baro_alt,
                 )
 
-                if global_rel_alt is None:
+                # Без GPS барометр є резервним джерелом висоти,
+                # але LOCAL_POSITION_NED має вищий пріоритет.
+                if not has_gps and local_rel_alt is None:
                     update_flight_altitude(
                         baro_rel_alt,
                         current_timestamp,
@@ -672,7 +674,9 @@ async def analyze(file: UploadFile = File(...)):
                             ned_alt,
                         )
 
-                        if global_rel_alt is None:
+                        # Для оптичної / локальної навігації без GPS
+                        # саме LOCAL_POSITION_NED є основним джерелом висоти.
+                        if not has_gps:
                             update_flight_altitude(
                                 local_rel_alt,
                                 current_timestamp,
@@ -812,20 +816,24 @@ async def analyze(file: UploadFile = File(...)):
 
             # GLOBAL POSITION
             elif msg_type == "GLOBAL_POSITION_INT":
-                if msg.lat != 0 or msg.lon != 0:
+                gps_position_valid = msg.lat != 0 or msg.lon != 0
+
+                # Не дозволяємо GLOBAL_POSITION_INT з lat/lon = 0
+                # заблокувати LOCAL_POSITION_NED на бортах без GPS.
+                if gps_position_valid:
                     has_gps = True
 
-                if hasattr(msg, "relative_alt"):
-                    rel_g = float(msg.relative_alt) / 1000.0
+                    if hasattr(msg, "relative_alt"):
+                        rel_g = float(msg.relative_alt) / 1000.0
 
-                    if valid_number(rel_g) and 0.0 <= rel_g <= MAX_ALTITUDE:
-                        global_rel_alt = rel_g
+                        if valid_number(rel_g) and 0.0 <= rel_g <= MAX_ALTITUDE:
+                            global_rel_alt = rel_g
 
-                        update_flight_altitude(
-                            global_rel_alt,
-                            current_timestamp,
-                            "GLOBAL_REL",
-                        )
+                            update_flight_altitude(
+                                global_rel_alt,
+                                current_timestamp,
+                                "GLOBAL_REL",
+                            )
 
             # VIBRATION
             elif msg_type == "VIBRATION":
