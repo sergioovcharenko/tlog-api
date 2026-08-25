@@ -179,26 +179,12 @@ async def analyze(file: UploadFile = File(...)):
         temp_priority = -1
 
         has_gps = False
-
-        # Legacy heuristic for optical navigation / LOITER diagnostics.
-        # NOTE: SYS_STATUS.load is autopilot CPU load, not a native optical-quality metric.
-        # Kept here to reproduce the behavior of the earlier analyzer.
-        vnav_quality_min_loiter = 999.0
-        vnav_quality_max_loiter = 0.0
-        vnav_samples = 0
-        loiter_has_origin = False
-        loiter_origin_failed = False
-
         first_timestamp = None
         current_timestamp = 0.0
         current_mode = "Невідомо"
         flight_modes = set()
         land_mode_triggered = False
         raw_timeline = []
-
-        # MAVLink 2 STATUSTEXT can be fragmented into 50-byte chunks.
-        # Keep fragments here until the full message is assembled.
-        statustext_chunks = {}
 
         def update_flight_altitude(new_alt, timestamp=None, source="UNKNOWN"):
             nonlocal curr_alt, max_alt, last_valid_alt, last_alt_timestamp, altitude_source
@@ -298,89 +284,6 @@ async def analyze(file: UploadFile = File(...)):
                     "VIDEO",
                 )
 
-
-        def decode_statustext_chunk(value):
-            """Decode one STATUSTEXT chunk without stripping meaningful spaces."""
-            if isinstance(value, bytes):
-                return value.decode("utf-8", errors="ignore").replace("\x00", "")
-            return str(value).replace("\x00", "")
-
-        def emit_statustext(full_text, timestamp, mode, severity):
-            """Add one complete STATUSTEXT message to the timeline."""
-            nonlocal rangefinder_failed_flag
-
-            full_text = full_text.strip()
-            if not full_text:
-                return
-
-            if "No rangefinder" in full_text or "VISP: No rangefinder" in full_text:
-                rangefinder_failed_flag = True
-
-            is_err = severity <= 4
-            prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
-            add_event(
-                f"{prefix}{full_text}",
-                timestamp,
-                mode,
-                is_err,
-                False,
-                "SYSTEM",
-            )
-
-        def handle_statustext(msg, timestamp, mode):
-            """Reassemble MAVLink 2 STATUSTEXT chunks into one logical message."""
-            chunk_text = decode_statustext_chunk(getattr(msg, "text", ""))
-            severity = int(getattr(msg, "severity", 6))
-            msg_id = int(getattr(msg, "id", 0) or 0)
-            chunk_seq = int(getattr(msg, "chunk_seq", 0) or 0)
-
-            # MAVLink 1 / legacy STATUSTEXT: no chunk identifier.
-            if msg_id == 0:
-                emit_statustext(chunk_text, timestamp, mode, severity)
-                return
-
-            # MAVLink STATUSTEXT text field is 50 bytes. A shorter chunk is final.
-            chunk_len = len(chunk_text.encode("utf-8", errors="ignore"))
-
-            if chunk_seq == 0:
-                # If the same ID was left unfinished, flush it rather than losing it.
-                old = statustext_chunks.pop(msg_id, None)
-                if old and old["text"]:
-                    emit_statustext(old["text"], old["timestamp"], old["mode"], old["severity"])
-
-                statustext_chunks[msg_id] = {
-                    "text": chunk_text,
-                    "severity": severity,
-                    "timestamp": timestamp,
-                    "mode": mode,
-                    "next_seq": 1,
-                }
-            else:
-                state = statustext_chunks.get(msg_id)
-                if state is None:
-                    # We missed the first chunk. Do not create a misleading partial message.
-                    return
-
-                if chunk_seq != state["next_seq"]:
-                    # Sequence gap/out-of-order chunk: flush what we have and drop this fragment.
-                    statustext_chunks.pop(msg_id, None)
-                    emit_statustext(state["text"], state["timestamp"], state["mode"], state["severity"])
-                    return
-
-                state["text"] += chunk_text
-                state["next_seq"] += 1
-
-            # Final chunk is shorter than the 50-byte STATUSTEXT payload.
-            if chunk_len < 50:
-                state = statustext_chunks.pop(msg_id, None)
-                if state is not None:
-                    emit_statustext(
-                        state["text"],
-                        state["timestamp"],
-                        state["mode"],
-                        state["severity"],
-                    )
-
         while True:
             msg = mav.recv_match(blocking=False)
             if msg is None:
@@ -448,15 +351,6 @@ async def analyze(file: UploadFile = File(...)):
                 if curr >= 0:
                     curr_amp = curr
                     max_current = max(max_current, curr)
-
-                # Legacy LOITER quality heuristic from the previous analyzer.
-                # SYS_STATUS.load is scaled by 10 here to preserve prior behavior.
-                if current_mode == "LOITER":
-                    vnav_val = getattr(msg, "load", 0) / 10.0
-                    if vnav_val > 0:
-                        vnav_samples += 1
-                        vnav_quality_min_loiter = min(vnav_quality_min_loiter, vnav_val)
-                        vnav_quality_max_loiter = max(vnav_quality_max_loiter, vnav_val)
 
             elif msg_type == "VFR_HUD":
                 latest_baro_alt = float(msg.alt)
@@ -570,13 +464,6 @@ async def analyze(file: UploadFile = File(...)):
                         global_rel_alt = rel_g
                         update_flight_altitude(global_rel_alt, current_timestamp, "GLOBAL_REL")
 
-                # Legacy LOITER-origin heuristic used by the earlier analyzer.
-                if current_mode == "LOITER":
-                    if msg.lat != 0 or msg.lon != 0:
-                        loiter_has_origin = True
-                    elif msg.lat == 0 and msg.lon == 0 and not loiter_has_origin:
-                        loiter_origin_failed = True
-
             elif msg_type == "VIBRATION":
                 max_vib_x = max(max_vib_x, msg.vibration_x)
                 max_vib_y = max(max_vib_y, msg.vibration_y)
@@ -611,20 +498,15 @@ async def analyze(file: UploadFile = File(...)):
 
             elif msg_type == "STATUSTEXT":
                 try:
-                    handle_statustext(msg, current_timestamp, current_mode)
+                    txt = clean_text(msg.text)
+                    if "No rangefinder" in txt or "VISP: No rangefinder" in txt:
+                        rangefinder_failed_flag = True
+                    severity = getattr(msg, "severity", 6)
+                    is_err = severity <= 4
+                    prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
+                    add_event(f"{prefix}{txt}", current_timestamp, current_mode, is_err, False, "SYSTEM")
                 except Exception:
                     pass
-
-        # Flush any unfinished STATUSTEXT at end-of-log so it is not silently lost.
-        for state in list(statustext_chunks.values()):
-            if state.get("text"):
-                emit_statustext(
-                    state["text"],
-                    state["timestamp"],
-                    state["mode"],
-                    state["severity"],
-                )
-        statustext_chunks.clear()
 
         if radio_bad_start is not None:
             max_radio_bad_duration = max(
@@ -638,8 +520,6 @@ async def analyze(file: UploadFile = File(...)):
             start_voltage = 0.0
         if arm_voltage is None:
             arm_voltage = start_voltage
-        if vnav_quality_min_loiter == 999.0:
-            vnav_quality_min_loiter = 0.0
 
         final_max_altitude = max(0.0, min(max_alt, MAX_ALTITUDE))
 
@@ -691,26 +571,6 @@ async def analyze(file: UploadFile = File(...)):
             ai_alerts.append(
                 "📡 <b>Відвалився далекомір (Rangefinder):</b> висота продовжувала визначатися іншими джерелами."
             )
-
-        if "LOITER" in flight_modes:
-            if loiter_has_origin:
-                ai_alerts.append(
-                    "✅ <b>Оптична навігація в Loiter:</b> Точку 0.0.0.0 успішно зафіксовано оптикою."
-                )
-            elif loiter_origin_failed:
-                ai_alerts.append(
-                    "⚠️ <b>Оптична навігація в Loiter:</b> Точку 0.0.0.0 не вдалося зафіксувати."
-                )
-
-            if vnav_samples > 0:
-                if vnav_quality_min_loiter < 40:
-                    ai_alerts.append(
-                        f"⚠️ <b>Низька якість Оптичної Навігації:</b> Якість розпізнавання падала до {round(vnav_quality_min_loiter)}%."
-                    )
-                else:
-                    ai_alerts.append(
-                        f"👁 <b>Якість Оптичної Навігації:</b> {round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%."
-                    )
 
         if radio_status_seen:
             if max_radio_bad_duration >= RADIO_DROPOUT_CRITICAL_SEC:
@@ -832,11 +692,6 @@ async def analyze(file: UploadFile = File(...)):
                 "clipping": clip_count,
                 "maxTemp": display_temp,
                 "tempSource": temp_source or "—",
-                "opticalQualityLoiter": (
-                    f"{round(vnav_quality_min_loiter)}%–{round(vnav_quality_max_loiter)}%"
-                    if vnav_samples > 0
-                    else "Немає даних"
-                ),
             },
             "radioChannels": {
                 "ch1": channel_range(1),
