@@ -268,6 +268,14 @@ async def analyze(file: UploadFile = File(...)):
         max_temp = -99.0
         temp_source_priority = 0
 
+        # ESC telemetry (ESC1..ESC4)
+        esc_temp_current = [None, None, None, None]
+        esc_temp_max = [None, None, None, None]
+        esc_rpm_current = [None, None, None, None]
+        esc_rpm_max = [0, 0, 0, 0]
+        esc_current_current = [None, None, None, None]
+        esc_current_max = [0.0, 0.0, 0.0, 0.0]
+
         # Optical navigation
         optical_zero_detected = False
         optical_zero_timestamp = None
@@ -369,6 +377,18 @@ async def analyze(file: UploadFile = File(...)):
                     "rssi": curr_rssi_pct if curr_rssi_pct > 0 else None,
                     "dbm": round(curr_dbm) if curr_dbm != 0 else None,
                     "temp": round(curr_temp, 1) if curr_temp is not None else None,
+                    "esc": [
+                        {
+                            "id": i + 1,
+                            "temp": round(esc_temp_current[i], 1) if esc_temp_current[i] is not None else None,
+                            "maxTemp": round(esc_temp_max[i], 1) if esc_temp_max[i] is not None else None,
+                            "rpm": int(esc_rpm_current[i]) if esc_rpm_current[i] is not None else None,
+                            "maxRpm": int(esc_rpm_max[i]),
+                            "current": round(esc_current_current[i], 1) if esc_current_current[i] is not None else None,
+                            "maxCurrent": round(esc_current_max[i], 1),
+                        }
+                        for i in range(4)
+                    ],
                     "system_text": "" if is_pilot_action else text,
                     "pilot_text": text if is_pilot_action else "",
                     "eventType": event_type,
@@ -433,6 +453,7 @@ async def analyze(file: UploadFile = File(...)):
                 optical_zero_timestamp = timestamp
                 optical_zero_text = full_txt
 
+                # Виводимо ОДИН дружній запис замість двох однакових подій.
                 add_event(
                     "✅ Відбито оптичний нуль: NED = 0.0,0.0,0.0",
                     timestamp,
@@ -441,6 +462,7 @@ async def analyze(file: UploadFile = File(...)):
                     False,
                     "SYSTEM",
                 )
+                return
 
             is_err = severity <= 4
             prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
@@ -604,9 +626,7 @@ async def analyze(file: UploadFile = File(...)):
                     latest_baro_alt - ground_baro_alt,
                 )
 
-                # Без GPS барометр є резервним джерелом висоти,
-                # але LOCAL_POSITION_NED має вищий пріоритет.
-                if not has_gps and local_rel_alt is None:
+                if global_rel_alt is None:
                     update_flight_altitude(
                         baro_rel_alt,
                         current_timestamp,
@@ -674,9 +694,7 @@ async def analyze(file: UploadFile = File(...)):
                             ned_alt,
                         )
 
-                        # Для оптичної / локальної навігації без GPS
-                        # саме LOCAL_POSITION_NED є основним джерелом висоти.
-                        if not has_gps:
+                        if global_rel_alt is None:
                             update_flight_altitude(
                                 local_rel_alt,
                                 current_timestamp,
@@ -816,24 +834,20 @@ async def analyze(file: UploadFile = File(...)):
 
             # GLOBAL POSITION
             elif msg_type == "GLOBAL_POSITION_INT":
-                gps_position_valid = msg.lat != 0 or msg.lon != 0
-
-                # Не дозволяємо GLOBAL_POSITION_INT з lat/lon = 0
-                # заблокувати LOCAL_POSITION_NED на бортах без GPS.
-                if gps_position_valid:
+                if msg.lat != 0 or msg.lon != 0:
                     has_gps = True
 
-                    if hasattr(msg, "relative_alt"):
-                        rel_g = float(msg.relative_alt) / 1000.0
+                if hasattr(msg, "relative_alt"):
+                    rel_g = float(msg.relative_alt) / 1000.0
 
-                        if valid_number(rel_g) and 0.0 <= rel_g <= MAX_ALTITUDE:
-                            global_rel_alt = rel_g
+                    if valid_number(rel_g) and 0.0 <= rel_g <= MAX_ALTITUDE:
+                        global_rel_alt = rel_g
 
-                            update_flight_altitude(
-                                global_rel_alt,
-                                current_timestamp,
-                                "GLOBAL_REL",
-                            )
+                        update_flight_altitude(
+                            global_rel_alt,
+                            current_timestamp,
+                            "GLOBAL_REL",
+                        )
 
             # VIBRATION
             elif msg_type == "VIBRATION":
@@ -925,6 +939,41 @@ async def analyze(file: UploadFile = File(...)):
                         raw_temp,
                         3,
                     )
+
+            # ESC TELEMETRY 1..4
+            elif msg_type == "ESC_TELEMETRY_1_TO_4":
+                temperatures = list(getattr(msg, "temperature", []) or [])
+                rpms = list(getattr(msg, "rpm", []) or [])
+                currents = list(getattr(msg, "current", []) or [])
+
+                for i in range(4):
+                    if i < len(temperatures):
+                        t = temperatures[i]
+                        if valid_number(t):
+                            t = float(t)
+                            if 0 < t < 150:
+                                esc_temp_current[i] = t
+                                if esc_temp_max[i] is None or t > esc_temp_max[i]:
+                                    esc_temp_max[i] = t
+
+                    if i < len(rpms):
+                        rpm = rpms[i]
+                        if valid_number(rpm):
+                            rpm = float(rpm)
+                            if rpm >= 0:
+                                esc_rpm_current[i] = rpm
+                                if rpm > esc_rpm_max[i]:
+                                    esc_rpm_max[i] = rpm
+
+                    if i < len(currents):
+                        raw_current = currents[i]
+                        if valid_number(raw_current):
+                            # MAVLink ESC_TELEMETRY current = centiampere (0.01 A)
+                            amps = float(raw_current) / 100.0
+                            if 0 <= amps < 500:
+                                esc_current_current[i] = amps
+                                if amps > esc_current_max[i]:
+                                    esc_current_max[i] = amps
 
             # STATUSTEXT with MAVLink2 chunk reassembly
             elif msg_type == "STATUSTEXT":
@@ -1040,21 +1089,25 @@ async def analyze(file: UploadFile = File(...)):
         mins, secs = divmod(duration_sec, 60)
 
         # Timeline
+        # 00:00.000 = момент ARM.
+        # Події до ARM показуються з мінусом, наприклад -00:32.983.
         timeline = []
-        base_t = first_timestamp or 0
+        base_t = arm_timestamp or first_timestamp or 0
 
         for ev in sorted(raw_timeline, key=lambda x: x["timestamp"]):
-            elapsed = max(
-                0.0,
-                ev["timestamp"] - base_t,
-            )
+            elapsed = ev["timestamp"] - base_t
+
+            sign = ""
+            if elapsed < 0:
+                sign = "-"
+                elapsed = abs(elapsed)
 
             t_minutes = int(elapsed // 60)
             t_seconds = elapsed - t_minutes * 60
 
             timeline.append(
                 {
-                    "time": f"{t_minutes:02d}:{t_seconds:06.3f}",
+                    "time": f"{sign}{t_minutes:02d}:{t_seconds:06.3f}",
                     "mode": ev["mode"],
                     "alt": ev["alt"],
                     "dist": ev["dist"],
@@ -1066,6 +1119,7 @@ async def analyze(file: UploadFile = File(...)):
                     "rssi": ev["rssi"],
                     "dbm": ev["dbm"],
                     "temp": ev["temp"],
+                    "esc": ev["esc"],
                     "systemText": ev["system_text"],
                     "pilotText": ev["pilot_text"],
                     "eventType": ev["eventType"],
@@ -1211,6 +1265,15 @@ async def analyze(file: UploadFile = File(...)):
                     f"{round(max_temp, 1)} °C."
                 )
 
+        # ESC temperature
+        for i, esc_t in enumerate(esc_temp_max):
+            if esc_t is not None and esc_t >= 85.0:
+                ai_alerts.append(
+                    f"🌡 <b>Критична температура ESC{i + 1}:</b> "
+                    f"{round(esc_t, 1)} °C."
+                )
+                is_critical = True
+
         # Attitude
         if max_roll > 80 or max_pitch > 80:
             ai_alerts.append(
@@ -1328,6 +1391,18 @@ async def analyze(file: UploadFile = File(...)):
                     if vnav_samples > 0
                     else "Немає даних"
                 ),
+                "esc": [
+                    {
+                        "id": i + 1,
+                        "temp": round(esc_temp_current[i], 1) if esc_temp_current[i] is not None else None,
+                        "maxTemp": round(esc_temp_max[i], 1) if esc_temp_max[i] is not None else None,
+                        "rpm": int(esc_rpm_current[i]) if esc_rpm_current[i] is not None else None,
+                        "maxRpm": int(esc_rpm_max[i]),
+                        "current": round(esc_current_current[i], 1) if esc_current_current[i] is not None else None,
+                        "maxCurrent": round(esc_current_max[i], 1),
+                    }
+                    for i in range(4)
+                ],
             },
             "radioChannels": {
                 "ch1": (
