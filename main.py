@@ -2,6 +2,7 @@
 import math
 import os
 import tempfile
+import re
 
 from fastapi import FastAPI, File, UploadFile
 from pymavlink import mavutil
@@ -134,27 +135,26 @@ def parse_initial_pos_ned(text):
     if "initial pos NED" not in text or "=" not in text:
         return None
 
+    values_part = text.split("=", 1)[1]
+    values_part = (
+        values_part
+        .replace("(m)", "")
+        .replace("m)", "")
+        .strip()
+    )
+
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", values_part)
+
+    if len(nums) < 3:
+        return None
+
     try:
-        values_part = text.split("=", 1)[1]
-        values_part = (
-            values_part
-            .replace("(m)", "")
-            .replace("m)", "")
-            .strip()
-        )
-
-        nums = re.findall(r"[-+]?\d+(?:\.\d+)?", values_part)
-
-        if len(nums) < 3:
-            return None
-
         return (
             float(nums[0]),
             float(nums[1]),
             float(nums[2]),
         )
-
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
