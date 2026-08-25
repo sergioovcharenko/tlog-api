@@ -276,13 +276,20 @@ async def analyze(file: UploadFile = File(...)):
         esc_current_current = [None, None, None, None]
         esc_current_max = [0.0, 0.0, 0.0, 0.0]
 
-        # Optical navigation
+        # Optical navigation / EKF
         optical_zero_detected = False
         optical_zero_timestamp = None
         optical_zero_text = None
         vnav_quality_min_loiter = 999
         vnav_quality_max_loiter = 0
         vnav_samples = 0
+
+        ekf_variance_count = 0
+        ekf_stopped_aiding_count = 0
+        loiter_position_fail_count = 0
+        external_nav_recovery_count = 0
+        smart_rtl_bad_position_count = 0
+        prearm_position_count = 0
 
         # Navigation
         has_gps = False
@@ -296,6 +303,7 @@ async def analyze(file: UploadFile = File(...)):
 
         # Timeline
         raw_timeline = []
+        last_snapshot_second = None
 
         # STATUSTEXT MAVLink2 chunks
         statustext_chunks = {}
@@ -396,6 +404,41 @@ async def analyze(file: UploadFile = File(...)):
                 }
             )
 
+        def add_snapshot(t_stamp):
+            """Додає телеметричний рядок без системної/пілотської події."""
+            raw_timeline.append(
+                {
+                    "timestamp": t_stamp or 0,
+                    "mode": current_mode,
+                    "alt": f"{round(curr_alt, 1)} м",
+                    "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
+                    "vtxBand": curr_vtx_band,
+                    "vtxChannel": curr_vtx_channel,
+                    "videoFreq": curr_video_freq,
+                    "volt": round(curr_voltage, 2) if curr_voltage > 0 else None,
+                    "curr": round(curr_amp, 1) if curr_amp >= 0 else None,
+                    "rssi": curr_rssi_pct if curr_rssi_pct > 0 else None,
+                    "dbm": round(curr_dbm) if curr_dbm != 0 else None,
+                    "temp": round(curr_temp, 1) if curr_temp is not None else None,
+                    "esc": [
+                        {
+                            "id": i + 1,
+                            "temp": round(esc_temp_current[i], 1) if esc_temp_current[i] is not None else None,
+                            "maxTemp": round(esc_temp_max[i], 1) if esc_temp_max[i] is not None else None,
+                            "rpm": int(esc_rpm_current[i]) if esc_rpm_current[i] is not None else None,
+                            "maxRpm": int(esc_rpm_max[i]),
+                            "current": round(esc_current_current[i], 1) if esc_current_current[i] is not None else None,
+                            "maxCurrent": round(esc_current_max[i], 1),
+                        }
+                        for i in range(4)
+                    ],
+                    "system_text": "",
+                    "pilot_text": "",
+                    "eventType": "SNAPSHOT",
+                    "isError": False,
+                }
+            )
+
         def update_vtx_from_rc(ch7, ch8, timestamp):
             nonlocal curr_video_freq, curr_vtx_band, curr_vtx_channel
             nonlocal last_video_freq, video_change_count
@@ -444,9 +487,32 @@ async def analyze(file: UploadFile = File(...)):
         def process_complete_statustext(full_txt, severity, timestamp, mode):
             nonlocal rangefinder_failed_flag
             nonlocal optical_zero_detected, optical_zero_timestamp, optical_zero_text
+            nonlocal ekf_variance_count, ekf_stopped_aiding_count
+            nonlocal loiter_position_fail_count, external_nav_recovery_count
+            nonlocal smart_rtl_bad_position_count, prearm_position_count
 
-            if "No rangefinder" in full_txt or "VISP: No rangefinder" in full_txt:
+            txt_lower = full_txt.lower()
+
+            if "no rangefinder" in txt_lower or "visp: no rangefinder" in txt_lower:
                 rangefinder_failed_flag = True
+
+            if "ekf variance" in txt_lower:
+                ekf_variance_count += 1
+
+            if "stopped aiding" in txt_lower:
+                ekf_stopped_aiding_count += 1
+
+            if "mode change to loiter failed" in txt_lower and "requires position" in txt_lower:
+                loiter_position_fail_count += 1
+
+            if "using external nav data" in txt_lower:
+                external_nav_recovery_count += 1
+
+            if "smartrtl deactivated" in txt_lower and "bad position" in txt_lower:
+                smart_rtl_bad_position_count += 1
+
+            if "prearm: need position estimate" in txt_lower:
+                prearm_position_count += 1
 
             if is_optical_zero_message(full_txt):
                 optical_zero_detected = True
@@ -465,10 +531,11 @@ async def analyze(file: UploadFile = File(...)):
                 return
 
             is_err = severity <= 4
-            prefix = "⚠️ ПОМИЛКА: " if is_err else "ℹ️ "
 
+            # Зберігаємо ОРИГІНАЛЬНИЙ текст STATUSTEXT без доданих префіксів.
+            # Колір/критичність визначає HTML через isError.
             add_event(
-                f"{prefix}{full_txt}",
+                full_txt,
                 timestamp,
                 mode,
                 is_err,
@@ -495,6 +562,14 @@ async def analyze(file: UploadFile = File(...)):
 
                 if first_timestamp is None:
                     first_timestamp = t_stamp
+
+                # 1 Hz telemetry timeline while ARMED.
+                # 00:00 corresponds to ARM; events keep their exact millisecond timestamps.
+                if is_currently_armed and arm_timestamp is not None:
+                    flight_second = int(current_timestamp - arm_timestamp)
+                    if flight_second >= 0 and flight_second != last_snapshot_second:
+                        last_snapshot_second = flight_second
+                        add_snapshot(arm_timestamp + flight_second)
 
             # HEARTBEAT
             if msg_type == "HEARTBEAT":
@@ -1147,55 +1222,99 @@ async def analyze(file: UploadFile = File(...)):
         )
 
         # ====================================================
-        # AI
+        # AI / FLIGHT ANALYSIS
         # ====================================================
 
         ai_alerts = []
         is_critical = False
 
-        if reboot_or_second_battery:
+        # Завершення польоту
+        if disarm_detected:
             ai_alerts.append(
-                "ℹ️ <b>Зафіксовано зміну живлення / новий політ.</b>"
+                "✅ <b>Завершення польоту:</b> зафіксовано DISARM. "
+                "Політ завершено штатним вимкненням двигунів."
             )
 
-        if rangefinder_failed_flag:
+        # Оптичний нуль / навігація
+        if optical_zero_detected:
             ai_alerts.append(
-                "📡 <b>Відвалився далекомір (Rangefinder):</b> "
-                "висота продовжувала визначатися іншими джерелами."
+                "✅ <b>Оптичний нуль відбито:</b> "
+                "зафіксовано початкові координати NED = 0.0,0.0,0.0. "
+                "Точка відліку оптичної навігації була встановлена."
+            )
+        elif "LOITER" in flight_modes or vnav_samples > 0:
+            ai_alerts.append(
+                "ℹ️ <b>Оптичний нуль:</b> у логові не знайдено "
+                "повідомлення про відбиття NED = 0.0,0.0,0.0."
             )
 
-        # Optical navigation
-        optical_context_present = (
-            "LOITER" in flight_modes
-            or optical_zero_detected
-            or vnav_samples > 0
-        )
-
-        if optical_context_present:
-            if optical_zero_detected:
+        # Показник, який історично використовувався як "якість оптики"
+        if vnav_samples > 0:
+            if vnav_quality_min_loiter < 40:
                 ai_alerts.append(
-                    "✅ <b>Оптична навігація в Loiter:</b> "
-                    "Точку 0.0,0.0,0.0 успішно зафіксовано оптикою."
+                    f"⚠️ <b>Низький показник у LOITER:</b> "
+                    f"мінімальне значення становило "
+                    f"{round(vnav_quality_min_loiter)}%. "
+                    "Потребує співставлення з подіями EKF/External Nav."
                 )
             else:
                 ai_alerts.append(
-                    "ℹ️ <b>Оптична навігація в Loiter:</b> "
-                    "Пілот не виконував відбиття точки 0.0,0.0,0.0."
+                    f"👁 <b>Показник LOITER:</b> "
+                    f"{round(vnav_quality_min_loiter)}%–"
+                    f"{round(vnav_quality_max_loiter)}%."
                 )
 
-            if vnav_samples > 0:
-                if vnav_quality_min_loiter < 40:
-                    ai_alerts.append(
-                        f"⚠️ <b>Низька якість Оптичної Навігації:</b> "
-                        f"Якість розпізнавання падала до "
-                        f"{round(vnav_quality_min_loiter)}%."
-                    )
-                else:
-                    ai_alerts.append(
-                        f"👁 <b>Якість Оптичної Навігації:</b> "
-                        f"{round(vnav_quality_min_loiter)}%–"
-                        f"{round(vnav_quality_max_loiter)}%."
-                    )
+        # EKF / External navigation
+        if (
+            ekf_variance_count
+            or ekf_stopped_aiding_count
+            or loiter_position_fail_count
+            or smart_rtl_bad_position_count
+        ):
+            parts = []
+
+            if ekf_variance_count:
+                parts.append(f"EKF variance: {ekf_variance_count}")
+
+            if ekf_stopped_aiding_count:
+                parts.append(f"stopped aiding: {ekf_stopped_aiding_count}")
+
+            if loiter_position_fail_count:
+                parts.append(
+                    f"LOITER requires position: {loiter_position_fail_count}"
+                )
+
+            if smart_rtl_bad_position_count:
+                parts.append(
+                    f"SmartRTL bad position: {smart_rtl_bad_position_count}"
+                )
+
+            ai_alerts.append(
+                "⚠️ <b>Нестабільність позиціонування / EKF:</b> "
+                + "; ".join(parts)
+                + "."
+            )
+
+        if external_nav_recovery_count:
+            ai_alerts.append(
+                f"🔄 <b>External Nav:</b> автопілот повторно переходив "
+                f"на зовнішню навігацію {external_nav_recovery_count} раз(и)."
+            )
+
+        if prearm_position_count:
+            ai_alerts.append(
+                f"ℹ️ <b>PreArm Position:</b> до запуску зафіксовано "
+                f"{prearm_position_count} повідомлень про відсутність "
+                "Position Estimate."
+            )
+
+        # Rangefinder
+        if rangefinder_failed_flag:
+            ai_alerts.append(
+                "📡 <b>Rangefinder недоступний:</b> "
+                "VISP повідомляв про відсутність даних далекоміра. "
+                "Висота продовжувала визначатися іншими джерелами."
+            )
 
         # Radio
         if radio_status_seen:
@@ -1204,53 +1323,61 @@ async def analyze(file: UploadFile = File(...)):
                     "📡 <b>Аномалія RADIO_STATUS:</b> "
                     f"граничні/нульові значення тривали до "
                     f"{round(max_radio_bad_duration, 2)} с. "
-                    "Фактична втрата керування не підтверджена."
+                    "Фактична втрата керування цим параметром не підтверджена."
                 )
-
             elif radio_bad_samples > 0:
                 ai_alerts.append(
-                    "📶 <b>Зафіксовано короткі граничні значення "
-                    "RADIO_STATUS.</b> Одиничне -128 не трактується "
-                    "як втрата борта."
+                    "📶 <b>RADIO_STATUS:</b> були короткі граничні "
+                    "значення; одиничний -128 не трактується як втрата борта."
                 )
 
         # Video
         if curr_video_freq is not None:
             ai_alerts.append(
-                "📺 <b>Відеоканал визначено за CH7 + CH8:</b> "
-                f"{curr_vtx_band} GHz / "
-                f"{curr_vtx_channel} / "
+                "📺 <b>Відеоканал:</b> "
+                f"{curr_vtx_band} GHz / {curr_vtx_channel} / "
                 f"{curr_video_freq} MHz. "
-                f"Змін за лог: {video_change_count}."
+                f"Зафіксовано змін VTX: {video_change_count}."
             )
         else:
             ai_alerts.append(
-                "ℹ️ <b>Відеочастоту не вдалося визначити:</b> "
-                "у TLOG немає коректних значень CH7/CH8."
+                "ℹ️ <b>Відеоканал:</b> частоту не вдалося визначити "
+                "за CH7 + CH8."
             )
 
         # Battery
         if 0 < min_voltage <= 16.8:
             is_critical = True
-
             ai_alerts.append(
-                "🪫 <b>Критична просадка:</b> "
-                f"{round(min_voltage, 1)} V."
+                "🪫 <b>Критична напруга:</b> "
+                f"мінімум {round(min_voltage, 2)} V."
             )
         elif 16.8 < min_voltage < 18.0:
             ai_alerts.append(
-                "🔋 <b>Глибока просадка:</b> "
-                f"{round(min_voltage, 1)} V."
+                "🔋 <b>Глибока просадка напруги:</b> "
+                f"мінімум {round(min_voltage, 2)} V."
+            )
+        elif min_voltage > 0:
+            ai_alerts.append(
+                "🔋 <b>Живлення:</b> "
+                f"ARM {round(arm_voltage, 2)} V, "
+                f"мінімум {round(min_voltage, 2)} V, "
+                f"просадка {round(max(0, arm_voltage - min_voltage), 2)} V."
             )
 
         # Current
         if max_current > 80.0:
             ai_alerts.append(
                 "⚡ <b>Високий струм:</b> "
-                f"{round(max_current, 1)} A."
+                f"пікове споживання {round(max_current, 1)} A (>80 A)."
+            )
+        else:
+            ai_alerts.append(
+                "⚡ <b>Струм:</b> "
+                f"максимальне споживання {round(max_current, 1)} A."
             )
 
-        # Temperature
+        # FC temperature
         if max_temp != -99.0:
             if max_temp >= 85.0:
                 ai_alerts.append(
@@ -1258,21 +1385,53 @@ async def analyze(file: UploadFile = File(...)):
                     f"{round(max_temp, 1)} °C."
                 )
                 is_critical = True
-
             elif max_temp >= 70.0:
                 ai_alerts.append(
                     "🌡 <b>Висока температура FC:</b> "
                     f"{round(max_temp, 1)} °C."
                 )
-
-        # ESC temperature
-        for i, esc_t in enumerate(esc_temp_max):
-            if esc_t is not None and esc_t >= 85.0:
+            else:
                 ai_alerts.append(
-                    f"🌡 <b>Критична температура ESC{i + 1}:</b> "
-                    f"{round(esc_t, 1)} °C."
+                    "🌡 <b>Температура FC:</b> "
+                    f"максимум {round(max_temp, 1)} °C — в межах норми."
                 )
-                is_critical = True
+
+        # ESC temperatures
+        esc_temps_available = [
+            t for t in esc_temp_max
+            if t is not None
+        ]
+
+        if esc_temps_available:
+            hottest_index = max(
+                range(4),
+                key=lambda i: esc_temp_max[i] if esc_temp_max[i] is not None else -1,
+            )
+            hottest_temp = esc_temp_max[hottest_index]
+
+            for i, esc_t in enumerate(esc_temp_max):
+                if esc_t is not None and esc_t >= 85.0:
+                    ai_alerts.append(
+                        f"🌡 <b>Критична температура ESC{i + 1}:</b> "
+                        f"{round(esc_t, 1)} °C."
+                    )
+                    is_critical = True
+
+            if hottest_temp < 85.0:
+                ai_alerts.append(
+                    f"🧊 <b>ESC:</b> найвища температура ESC"
+                    f"{hottest_index + 1} — {round(hottest_temp, 1)} °C. "
+                    "Критичного перегріву не зафіксовано."
+                )
+
+            if len(esc_temps_available) >= 2:
+                spread = max(esc_temps_available) - min(esc_temps_available)
+
+                if spread >= 20.0:
+                    ai_alerts.append(
+                        "⚠️ <b>Нерівномірний нагрів ESC:</b> "
+                        f"різниця між ESC становила {round(spread, 1)} °C."
+                    )
 
         # Attitude
         if max_roll > 80 or max_pitch > 80:
@@ -1292,30 +1451,42 @@ async def analyze(file: UploadFile = File(...)):
             )
             is_critical = True
 
-        # Verdict
+        # Final verdict
+        navigation_problem = (
+            ekf_variance_count > 0
+            or ekf_stopped_aiding_count > 0
+            or loiter_position_fail_count > 0
+            or smart_rtl_bad_position_count > 0
+        )
+
         if disarm_detected:
             if is_critical:
                 ai_verdict = (
                     "⚠️ БОРТ ЗАВЕРШИВ ПОЛІТ. "
-                    "ПІД ЧАС ПОЛЬОТУ ЗАФІКСОВАНО КРИТИЧНІ ПОДІЇ:"
+                    "ЗАФІКСОВАНО КРИТИЧНІ ПОДІЇ:"
+                )
+            elif navigation_problem or max_current > 80.0 or rangefinder_failed_flag:
+                ai_verdict = (
+                    "🟡 БОРТ ЗАВЕРШИВ ПОЛІТ. "
+                    "ПІД ЧАС ПОЛЬОТУ ЗАФІКСОВАНО ВІДХИЛЕННЯ:"
                 )
             else:
-                ai_verdict = "✅ БОРТ ЗАВЕРШИВ ПОЛІТ."
-
+                ai_verdict = (
+                    "✅ БОРТ ЗАВЕРШИВ ПОЛІТ. "
+                    "КРИТИЧНИХ ВІДХИЛЕНЬ НЕ ЗАФІКСОВАНО:"
+                )
         elif log_ended_armed:
             ai_verdict = (
                 "🚨 ЛОГ ОБІРВАВСЯ ПРИ ARMED. "
                 "ПОТРІБНА ПЕРЕВІРКА:"
             )
-
         elif is_critical:
             ai_verdict = (
-                "⚠️ ПІД ЧАС ПОЛЬОТУ "
-                "ЗАФІКСОВАНО КРИТИЧНІ ПОДІЇ:"
+                "⚠️ ПІД ЧАС ПОЛЬОТУ ЗАФІКСОВАНО "
+                "КРИТИЧНІ ПОДІЇ:"
             )
-
         else:
-            ai_verdict = "📊 РЕЗУЛЬТАТИ АНАЛІЗУ ПОЛЬОТУ:"
+            ai_verdict = "📊 ПОВНИЙ АНАЛІЗ ПОЛЬОТУ:"
 
         return {
             "success": True,
@@ -1326,6 +1497,11 @@ async def analyze(file: UploadFile = File(...)):
                 "disarmDetected": disarm_detected,
                 "opticalZeroDetected": optical_zero_detected,
                 "opticalZeroText": optical_zero_text,
+                "ekfVarianceCount": ekf_variance_count,
+                "ekfStoppedAidingCount": ekf_stopped_aiding_count,
+                "loiterPositionFailCount": loiter_position_fail_count,
+                "externalNavRecoveryCount": external_nav_recovery_count,
+                "smartRtlBadPositionCount": smart_rtl_bad_position_count,
                 "alerts": ai_alerts,
             },
             "flight": {
