@@ -118,49 +118,68 @@ def get_vtx_state(ch7_pwm, ch8_pwm):
     }
 
 
-def is_optical_zero_message(text):
+def parse_initial_pos_ned(text):
     """
-    Detects a status message such as:
-    EKF3 IMU0 initial pos NED = 0.0,0.0,0.0,0.0 (m)
+    Parses messages such as:
+      EKF3 IMU0 initial pos NED = 0.0,0.0,0.0 (m)
+      EKF3 IMU0 initial pos NED = -0.1,0.4,0.8,0.0 (m)
 
-    At least the first three NED values must be approximately zero.
+    Returns (N, E, D) for the first three values, or None.
     """
     if not text:
-        return False
+        return None
 
     text = clean_text(text)
 
-    if "EKF3" not in text or "initial pos NED" not in text or "=" not in text:
-        return False
+    if "initial pos NED" not in text or "=" not in text:
+        return None
 
     try:
         values_part = text.split("=", 1)[1]
-        values_part = values_part.replace("(m)", "").replace("m)", "").strip()
+        values_part = (
+            values_part
+            .replace("(m)", "")
+            .replace("m)", "")
+            .strip()
+        )
 
-        nums = []
-
-        for part in values_part.split(","):
-            part = part.strip()
-            if not part:
-                continue
-
-            number_text = ""
-            for char in part:
-                if char.isdigit() or char in ".-+":
-                    number_text += char
-                else:
-                    break
-
-            if number_text:
-                nums.append(float(number_text))
+        nums = re.findall(r"[-+]?\d+(?:\.\d+)?", values_part)
 
         if len(nums) < 3:
-            return False
+            return None
 
-        return all(abs(x) <= 0.01 for x in nums[:3])
+        return (
+            float(nums[0]),
+            float(nums[1]),
+            float(nums[2]),
+        )
 
     except Exception:
+        return None
+
+
+def is_primary_false_ned(coords, limit=0.9):
+    """
+    Primary false/initial optical coordinates may be small non-zero values.
+    Examples: 0.1,0.2,0.3 or -0.1,0.4,-0.8.
+    All three N/E/D values must be within ±limit meters.
+    """
+    if not coords or len(coords) < 3:
         return False
+
+    return all(abs(float(v)) <= limit for v in coords[:3])
+
+
+def format_ned(coords):
+    if not coords:
+        return None
+
+    def fmt(v):
+        if abs(v) < 0.0005:
+            v = 0.0
+        return f"{v:.1f}"
+
+    return ",".join(fmt(v) for v in coords[:3])
 
 
 # ============================================================
@@ -277,9 +296,23 @@ async def analyze(file: UploadFile = File(...)):
         esc_current_max = [0.0, 0.0, 0.0, 0.0]
 
         # Optical navigation / EKF
-        optical_zero_detected = False
+        # First false coordinates do not have to be exact zeroes.
+        optical_zero_detected = False  # compatibility field
         optical_zero_timestamp = None
         optical_zero_text = None
+
+        first_loiter_timestamp = None
+        first_loiter_mode_seen = False
+
+        primary_false_ned_detected = False
+        primary_false_ned_coords = None
+        primary_false_ned_timestamp = None
+        primary_false_ned_text = None
+
+        ned_initializations = []
+
+        # SYS_STATUS.load is kept only as a diagnostic field.
+        # It is NOT treated as optical-navigation quality in the AI conclusion.
         vnav_quality_min_loiter = 999
         vnav_quality_max_loiter = 0
         vnav_samples = 0
@@ -300,6 +333,7 @@ async def analyze(file: UploadFile = File(...)):
         current_mode = "Невідомо"
         flight_modes = set()
         land_mode_triggered = False
+        disarm_mode = None
 
         # Timeline
         raw_timeline = []
@@ -487,6 +521,10 @@ async def analyze(file: UploadFile = File(...)):
         def process_complete_statustext(full_txt, severity, timestamp, mode):
             nonlocal rangefinder_failed_flag
             nonlocal optical_zero_detected, optical_zero_timestamp, optical_zero_text
+            nonlocal primary_false_ned_detected
+            nonlocal primary_false_ned_coords
+            nonlocal primary_false_ned_timestamp
+            nonlocal primary_false_ned_text
             nonlocal ekf_variance_count, ekf_stopped_aiding_count
             nonlocal loiter_position_fail_count, external_nav_recovery_count
             nonlocal smart_rtl_bad_position_count, prearm_position_count
@@ -514,26 +552,22 @@ async def analyze(file: UploadFile = File(...)):
             if "prearm: need position estimate" in txt_lower:
                 prearm_position_count += 1
 
-            if is_optical_zero_message(full_txt):
-                optical_zero_detected = True
-                optical_zero_timestamp = timestamp
-                optical_zero_text = full_txt
+            # Save every original "initial pos NED" found in the TLOG.
+            ned_coords = parse_initial_pos_ned(full_txt)
 
-                # Виводимо ОДИН дружній запис замість двох однакових подій.
-                add_event(
-                    "✅ Відбито оптичний нуль: NED = 0.0,0.0,0.0",
-                    timestamp,
-                    mode,
-                    False,
-                    False,
-                    "SYSTEM",
-                )
-                return
+            if ned_coords is not None:
+                item = {
+                    "timestamp": timestamp,
+                    "mode": mode,
+                    "coords": ned_coords,
+                    "text": full_txt,
+                    "isSmallPrimaryCandidate": is_primary_false_ned(ned_coords),
+                }
+                ned_initializations.append(item)
 
             is_err = severity <= 4
 
-            # Зберігаємо ОРИГІНАЛЬНИЙ текст STATUSTEXT без доданих префіксів.
-            # Колір/критичність визначає HTML через isError.
+            # Keep original ArduPilot STATUSTEXT in timeline.
             add_event(
                 full_txt,
                 timestamp,
@@ -593,6 +627,10 @@ async def analyze(file: UploadFile = File(...)):
                         current_mode = new_mode
                         flight_modes.add(current_mode)
 
+                        if current_mode == "LOITER" and first_loiter_timestamp is None:
+                            first_loiter_timestamp = current_timestamp
+                            first_loiter_mode_seen = True
+
                         if current_mode == "LAND":
                             land_mode_triggered = True
 
@@ -621,6 +659,7 @@ async def analyze(file: UploadFile = File(...)):
                     elif not is_armed and was_armed:
                         disarm_detected = True
                         disarm_timestamp = current_timestamp
+                        disarm_mode = current_mode
 
                         if curr_alt < 5.0 or current_mode == "LAND":
                             landed_successfully = True
@@ -1108,6 +1147,97 @@ async def analyze(file: UploadFile = File(...)):
                 item["mode"],
             )
 
+        # ====================================================
+        # PRIMARY FALSE NED SELECTION
+        # ====================================================
+        # The first false coordinates are expected around the FIRST LOITER.
+        # They may be mixed positive/negative values, approximately
+        # from -0.9 to +0.9 m on N/E/D.
+
+        primary_false_ned_detected = False
+        primary_false_ned_coords = None
+        primary_false_ned_timestamp = None
+        primary_false_ned_text = None
+
+        if first_loiter_timestamp is not None:
+            small_candidates = [
+                item
+                for item in ned_initializations
+                if item["isSmallPrimaryCandidate"]
+            ]
+
+            nearby = [
+                item
+                for item in small_candidates
+                if (
+                    item["timestamp"] is not None
+                    and first_loiter_timestamp - 5.0
+                    <= item["timestamp"]
+                    <= first_loiter_timestamp + 15.0
+                )
+            ]
+
+            if nearby:
+                selected = min(
+                    nearby,
+                    key=lambda item: abs(
+                        item["timestamp"] - first_loiter_timestamp
+                    ),
+                )
+
+                primary_false_ned_detected = True
+                primary_false_ned_coords = selected["coords"]
+                primary_false_ned_timestamp = selected["timestamp"]
+                primary_false_ned_text = selected["text"]
+
+            elif small_candidates:
+                close_candidates = [
+                    item
+                    for item in small_candidates
+                    if (
+                        item["timestamp"] is not None
+                        and abs(
+                            item["timestamp"] - first_loiter_timestamp
+                        ) <= 60.0
+                    )
+                ]
+
+                if close_candidates:
+                    selected = min(
+                        close_candidates,
+                        key=lambda item: abs(
+                            item["timestamp"] - first_loiter_timestamp
+                        ),
+                    )
+
+                    primary_false_ned_detected = True
+                    primary_false_ned_coords = selected["coords"]
+                    primary_false_ned_timestamp = selected["timestamp"]
+                    primary_false_ned_text = selected["text"]
+
+        # Compatibility fields used by the existing HTML/API.
+        optical_zero_detected = primary_false_ned_detected
+        optical_zero_timestamp = primary_false_ned_timestamp
+        optical_zero_text = primary_false_ned_text
+
+        repeated_ned_initializations = []
+
+        if primary_false_ned_timestamp is not None:
+            for item in ned_initializations:
+                if (
+                    item["timestamp"] is not None
+                    and item["timestamp"] > primary_false_ned_timestamp + 0.25
+                ):
+                    repeated_ned_initializations.append(item)
+
+        elif first_loiter_timestamp is not None:
+            for item in ned_initializations:
+                if (
+                    item["timestamp"] is not None
+                    and item["timestamp"] >= first_loiter_timestamp
+                ):
+                    repeated_ned_initializations.append(item)
+
         # Final radio bad period
         if radio_bad_start is not None:
             max_radio_bad_duration = max(
@@ -1228,40 +1358,66 @@ async def analyze(file: UploadFile = File(...)):
         ai_alerts = []
         is_critical = False
 
-        # Завершення польоту
+        # Завершення польоту / LAND -> automatic DISARM
         if disarm_detected:
-            ai_alerts.append(
-                "✅ <b>Завершення польоту:</b> зафіксовано DISARM. "
-                "Політ завершено штатним вимкненням двигунів."
-            )
-
-        # Оптичний нуль / навігація
-        if optical_zero_detected:
-            ai_alerts.append(
-                "✅ <b>Оптичний нуль відбито:</b> "
-                "зафіксовано початкові координати NED = 0.0,0.0,0.0. "
-                "Точка відліку оптичної навігації була встановлена."
-            )
-        elif "LOITER" in flight_modes or vnav_samples > 0:
-            ai_alerts.append(
-                "ℹ️ <b>Оптичний нуль:</b> у логові не знайдено "
-                "повідомлення про відбиття NED = 0.0,0.0,0.0."
-            )
-
-        # Показник, який історично використовувався як "якість оптики"
-        if vnav_samples > 0:
-            if vnav_quality_min_loiter < 40:
+            if disarm_mode == "LAND":
                 ai_alerts.append(
-                    f"⚠️ <b>Низький показник у LOITER:</b> "
-                    f"мінімальне значення становило "
-                    f"{round(vnav_quality_min_loiter)}%. "
-                    "Потребує співставлення з подіями EKF/External Nav."
+                    "✅ <b>Посадка завершена:</b> перед DISARM був активний "
+                    "режим LAND. Після завершення посадки автопілот "
+                    "автоматично виконав DISARM."
                 )
             else:
                 ai_alerts.append(
-                    f"👁 <b>Показник LOITER:</b> "
-                    f"{round(vnav_quality_min_loiter)}%–"
-                    f"{round(vnav_quality_max_loiter)}%."
+                    "ℹ️ <b>DISARM:</b> зафіксовано вимкнення двигунів "
+                    f"у режимі {disarm_mode or current_mode}. "
+                    "Автоматичну посадку LAND за цим DISARM не підтверджено."
+                )
+
+        # Primary false coordinates around first LOITER.
+        if first_loiter_timestamp is not None:
+            if primary_false_ned_detected:
+                ned_text = format_ned(primary_false_ned_coords)
+
+                ai_alerts.append(
+                    "✅ <b>Первинні хибні координати відбито:</b> "
+                    "при першому переході в LOITER у TLOG зафіксовано "
+                    f"initial pos NED = {ned_text} м. "
+                    "Початкову точку External/Optical Nav встановлено."
+                )
+            else:
+                ai_alerts.append(
+                    "⚠️ <b>Первинні хибні координати не зафіксовано:</b> "
+                    "у TLOG не знайдено малого initial pos NED "
+                    "приблизно в межах -0.9…+0.9 м по N/E/D "
+                    "біля першого переходу в LOITER."
+                )
+
+        elif ever_armed:
+            ai_alerts.append(
+                "ℹ️ <b>LOITER не зафіксовано:</b> у цьому TLOG немає "
+                "переходу в LOITER, тому момент відбиття первинних "
+                "хибних координат за цією логікою не підтверджено."
+            )
+
+        # Later NED re-initializations are not treated as the first false coordinates.
+        if repeated_ned_initializations:
+            large_reinits = [
+                item
+                for item in repeated_ned_initializations
+                if not item["isSmallPrimaryCandidate"]
+            ]
+
+            if large_reinits:
+                examples = ", ".join(
+                    format_ned(item["coords"])
+                    for item in large_reinits[:3]
+                )
+
+                ai_alerts.append(
+                    "🔄 <b>Повторна ініціалізація NED:</b> "
+                    f"після первинного відбиття зафіксовано "
+                    f"{len(large_reinits)} великих/ненульових "
+                    f"initial pos NED. Приклад: {examples} м."
                 )
 
         # EKF / External navigation
@@ -1494,9 +1650,20 @@ async def analyze(file: UploadFile = File(...)):
                 "verdict": ai_verdict,
                 "isCritical": is_critical,
                 "landedSuccessfully": landed_successfully,
+                "disarmMode": disarm_mode,
                 "disarmDetected": disarm_detected,
                 "opticalZeroDetected": optical_zero_detected,
                 "opticalZeroText": optical_zero_text,
+                "firstLoiterTimestamp": first_loiter_timestamp,
+                "primaryFalseNedDetected": primary_false_ned_detected,
+                "primaryFalseNed": (
+                    list(primary_false_ned_coords)
+                    if primary_false_ned_coords is not None
+                    else None
+                ),
+                "primaryFalseNedText": primary_false_ned_text,
+                "nedInitializationCount": len(ned_initializations),
+                "repeatedNedInitializationCount": len(repeated_ned_initializations),
                 "ekfVarianceCount": ekf_variance_count,
                 "ekfStoppedAidingCount": ekf_stopped_aiding_count,
                 "loiterPositionFailCount": loiter_position_fail_count,
