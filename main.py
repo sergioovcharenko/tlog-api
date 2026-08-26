@@ -45,6 +45,10 @@ LAND_SPEED_RATIO_WARNING = 1.35
 LAND_SPEED_MIN_ABNORMAL_MPS = 1.5
 LAND_FREEFALL_ACCEL_MPS2 = 2.5
 LAND_ANALYSIS_MIN_SAMPLES = 5
+FLIGHT_TAKEOFF_ALT_M = 2.0
+FLIGHT_LANDED_ALT_M = 0.8
+FLIGHT_MIN_AIRBORNE_SEC = 1.5
+FLIGHT_MIN_GROUND_GAP_SEC = 1.0
 
 # Antenna-station inference from the TLOG.
 # IMPORTANT: this is an estimate, not a direct measurement of antenna azimuth.
@@ -389,6 +393,154 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         }
 
     return result
+
+
+def analyze_flight_sessions(raw_timeline, log_end_timestamp=None):
+    """One flight = ARM->DISARM. Re-takeoff without DISARM stays in same flight."""
+    events=sorted([e for e in raw_timeline if e.get("timestamp") is not None],
+                  key=lambda e:e["timestamp"])
+    sessions=[]
+    active=None
+
+    for ev in events:
+        txt=str(ev.get("system_text") or "")
+        ts=ev["timestamp"]
+        if "🟢 Двигуни запущено" in txt:
+            if active is not None:
+                active["endedArmed"]=True
+                active["endTimestamp"]=ts
+                active["duration"]=round(max(0.0,ts-active["armTimestamp"]),2)
+            active={
+                "number":len(sessions)+1,"armTimestamp":ts,"disarmTimestamp":None,
+                "endTimestamp":None,"duration":None,"endedArmed":False,
+                "takeoffEpisodes":[],"maxAltitude":0.0,"maxCurrent":0.0,
+                "minVoltage":None,"maxVibration":0.0,"maxTilt":0.0
+            }
+            sessions.append(active)
+        elif "🔴 Двигуни зупинено" in txt and active is not None:
+            active["disarmTimestamp"]=ts
+            active["endTimestamp"]=ts
+            active["duration"]=round(max(0.0,ts-active["armTimestamp"]),2)
+            active=None
+
+    if active is not None:
+        end_ts=log_end_timestamp if log_end_timestamp is not None else (events[-1]["timestamp"] if events else active["armTimestamp"])
+        active["endedArmed"]=True
+        active["endTimestamp"]=end_ts
+        active["duration"]=round(max(0.0,end_ts-active["armTimestamp"]),2)
+
+    for s in sessions:
+        evs=[e for e in events if e["timestamp"]>=s["armTimestamp"] and
+             (s["endTimestamp"] is None or e["timestamp"]<=s["endTimestamp"])]
+
+        for ev in evs:
+            if valid_number(ev.get("alt")):
+                s["maxAltitude"]=max(s["maxAltitude"],max(0.0,float(ev["alt"])))
+            if valid_number(ev.get("curr")):
+                s["maxCurrent"]=max(s["maxCurrent"],max(0.0,float(ev["curr"])))
+            if valid_number(ev.get("volt")) and float(ev["volt"])>0:
+                if s["minVoltage"] is None or float(ev["volt"])<s["minVoltage"]:
+                    s["minVoltage"]=float(ev["volt"])
+            vib=ev.get("vibration")
+            if isinstance(vib,dict):
+                vals=[abs(float(vib[k])) for k in ("x","y","z") if valid_number(vib.get(k))]
+                if vals:s["maxVibration"]=max(s["maxVibration"],max(vals))
+            att=ev.get("attitude")
+            if isinstance(att,dict):
+                vals=[abs(float(att[k])) for k in ("roll","pitch") if valid_number(att.get(k))]
+                if vals:s["maxTilt"]=max(s["maxTilt"],max(vals))
+
+        airborne=False
+        take_candidate=None
+        ground_candidate=None
+        ep=None
+        for ev in evs:
+            if not valid_number(ev.get("alt")): continue
+            ts=ev["timestamp"]; alt=max(0.0,float(ev["alt"]))
+            if not airborne:
+                if alt>=FLIGHT_TAKEOFF_ALT_M:
+                    if take_candidate is None: take_candidate=ts
+                    if ts-take_candidate>=FLIGHT_MIN_AIRBORNE_SEC:
+                        airborne=True
+                        ep={"number":len(s["takeoffEpisodes"])+1,
+                            "startTimestamp":take_candidate,"endTimestamp":None,
+                            "duration":None,"endReason":None,"maxAltitude":alt}
+                        s["takeoffEpisodes"].append(ep)
+                        ground_candidate=None
+                else:
+                    take_candidate=None
+            else:
+                ep["maxAltitude"]=max(float(ep.get("maxAltitude") or 0),alt)
+                if alt<=FLIGHT_LANDED_ALT_M:
+                    if ground_candidate is None: ground_candidate=ts
+                    if ts-ground_candidate>=FLIGHT_MIN_GROUND_GAP_SEC:
+                        ep["endTimestamp"]=ground_candidate
+                        ep["duration"]=round(max(0.0,ground_candidate-ep["startTimestamp"]),2)
+                        ep["endReason"]="landed"
+                        ep=None; airborne=False; take_candidate=None
+                else:
+                    ground_candidate=None
+
+        if airborne and ep is not None:
+            ep["endTimestamp"]=s["endTimestamp"]
+            ep["duration"]=round(max(0.0,s["endTimestamp"]-ep["startTimestamp"]),2) if s["endTimestamp"] is not None else None
+            ep["endReason"]="log_end" if s["endedArmed"] else "disarm"
+
+        s["takeoffEpisodeCount"]=len(s["takeoffEpisodes"])
+        s["hasRepeatedTakeoff"]=s["takeoffEpisodeCount"]>1
+        s["maxAltitude"]=round(float(s["maxAltitude"]),1)
+        s["maxCurrent"]=round(float(s["maxCurrent"]),1)
+        s["minVoltage"]=round(float(s["minVoltage"]),2) if s["minVoltage"] is not None else None
+        s["maxVibration"]=round(float(s["maxVibration"]),1)
+        s["maxTilt"]=round(float(s["maxTilt"]),1)
+
+    for ev in raw_timeline:
+        ev["flightNumber"]=None; ev["takeoffEpisodeNumber"]=None
+        ts=ev.get("timestamp")
+        if ts is None: continue
+        for s in sessions:
+            if ts>=s["armTimestamp"] and (s["endTimestamp"] is None or ts<=s["endTimestamp"]):
+                ev["flightNumber"]=s["number"]
+                for ep in s["takeoffEpisodes"]:
+                    if ts>=ep["startTimestamp"] and (ep.get("endTimestamp") is None or ts<=ep["endTimestamp"]):
+                        ev["takeoffEpisodeNumber"]=ep["number"]; break
+                break
+
+    def clone_near(ts):
+        return dict(min(events,key=lambda e:abs(e["timestamp"]-ts))) if events else {"timestamp":ts,"mode":"","alt":0.0,"dist":0.0}
+
+    markers=[]
+    for s in sessions:
+        r=clone_near(s["armTimestamp"])
+        r.update(timestamp=s["armTimestamp"],system_text=f"🟢 ПОЛІТ №{s['number']} — ПОЧАТОК СЕСІЇ / ARM",
+                 eventType="FLIGHT_SESSION_START",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=None)
+        markers.append(r)
+        for ep in s["takeoffEpisodes"]:
+            r=clone_near(ep["startTimestamp"])
+            r.update(timestamp=ep["startTimestamp"],
+                     system_text=f"↗ {'ПОВТОРНИЙ ЗЛІТ' if ep['number']>1 else 'ЗЛІТ'} — політ №{s['number']}, епізод {ep['number']}",
+                     eventType="FLIGHT_TAKEOFF",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=ep["number"])
+            markers.append(r)
+            if ep.get("endTimestamp") is not None and ep.get("endReason")=="landed":
+                r=clone_near(ep["endTimestamp"])
+                r.update(timestamp=ep["endTimestamp"],
+                         system_text=f"↘ ПОСАДКА — політ №{s['number']}, епізод {ep['number']} завершено БЕЗ DISARM",
+                         eventType="FLIGHT_LANDING",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=ep["number"])
+                markers.append(r)
+        if s.get("disarmTimestamp") is not None:
+            r=clone_near(s["disarmTimestamp"])
+            r.update(timestamp=s["disarmTimestamp"],system_text=f"🔵 ПОЛІТ №{s['number']} — ЗАВЕРШЕННЯ СЕСІЇ / DISARM",
+                     eventType="FLIGHT_SESSION_END",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=None)
+            markers.append(r)
+        elif s.get("endedArmed"):
+            r=clone_near(s["endTimestamp"])
+            r.update(timestamp=s["endTimestamp"],system_text=f"🚨 ПОЛІТ №{s['number']} — TLOG ЗАВЕРШИВСЯ ПРИ ARMED",
+                     eventType="FLIGHT_SESSION_OPEN_AT_END",is_error=True,flightNumber=s["number"],takeoffEpisodeNumber=None)
+            markers.append(r)
+
+    raw_timeline.extend(markers)
+    raw_timeline.sort(key=lambda e:e.get("timestamp",0))
+    return sessions
 
 def parse_dbm(raw_val):
     if raw_val is None:
@@ -2286,14 +2438,18 @@ async def analyze(file: UploadFile = File(...)):
                     curr_alt = old_alt
                     curr_vertical_speed_down = old_vz
 
+        # Detect all ARM->DISARM sessions in this TLOG.
+        flight_sessions = analyze_flight_sessions(raw_timeline, current_timestamp)
+        first_flight_arm_timestamp = flight_sessions[0]["armTimestamp"] if flight_sessions else arm_timestamp
+
         # Estimate antenna pointing from NED position azimuth + dBm.
-        antenna_analysis = analyze_antenna_direction(raw_timeline, arm_timestamp)
+        antenna_analysis = analyze_antenna_direction(raw_timeline, first_flight_arm_timestamp)
 
         # Timeline
         # 00:00.000 = момент ARM.
         # Події до ARM показуються з мінусом, наприклад -00:32.983.
         timeline = []
-        base_t = arm_timestamp or first_timestamp or 0
+        base_t = first_flight_arm_timestamp or arm_timestamp or first_timestamp or 0
 
         for ev in sorted(raw_timeline, key=lambda x: x["timestamp"]):
             elapsed = ev["timestamp"] - base_t
@@ -2330,6 +2486,8 @@ async def analyze(file: UploadFile = File(...)):
                     "attitude": ev.get("attitude"),
                     "rpmAnalysis": ev.get("rpmAnalysis"),
                     "verticalSpeedDown": ev.get("verticalSpeedDown"),
+                    "flightNumber": ev.get("flightNumber"),
+                    "takeoffEpisodeNumber": ev.get("takeoffEpisodeNumber"),
                     "systemText": ev["system_text"],
                     "pilotText": ev["pilot_text"],
                     "eventType": ev["eventType"],
@@ -2379,6 +2537,51 @@ async def analyze(file: UploadFile = File(...)):
                 )
 
 
+        # Flight-session structure in a TLOG that may contain several flights.
+        if flight_sessions:
+            count=len(flight_sessions)
+            first_time=format_timeline_time(flight_sessions[0]["armTimestamp"],base_t)
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{first_time}">'
+                f"🛫 <b>Структура TLOG:</b> виявлено {count} "
+                f"{'польотну сесію' if count==1 else 'польотні сесії'}. "
+                "Новий політ рахується тільки після нового ARM, який іде після DISARM. "
+                "Посадка і повторний зліт без DISARM залишаються одним польотом. "
+                "Натисніть, щоб перейти до першого ARM.</span>"
+            )
+            for s in flight_sessions:
+                arm_t=format_timeline_time(s["armTimestamp"],base_t)
+                dur=float(s.get("duration") or 0); mm=int(dur//60); ss=dur-mm*60
+                if s.get("endedArmed"):
+                    icon="🚨"; status="TLOG завершився при ARMED; DISARM не зафіксовано"
+                else:
+                    icon="✅"; status="DISARM "+format_timeline_time(s["disarmTimestamp"],base_t)
+                n=s.get("takeoffEpisodeCount",0)
+                if n==0: eps="підтверджений зліт ≥2 м не визначено"
+                elif n==1: eps="1 злітно-посадковий епізод"
+                else: eps=f"{n} злітно-посадкові епізоди; був повторний зліт без DISARM"
+                minv=s.get("minVoltage")
+                minvt=f"; MIN V {minv:.2f} V" if minv is not None else ""
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{arm_t}">'
+                    f"{icon} <b>Політ №{s['number']}:</b> ARM {arm_t}; {status}. "
+                    f"Тривалість {mm:02d}:{ss:04.1f}; {eps}. "
+                    f"MAX ALT {s.get('maxAltitude',0):.1f} м; MAX струм {s.get('maxCurrent',0):.1f} A{minvt}. "
+                    "Натисніть, щоб перейти до початку польоту.</span>"
+                )
+                for ep in s.get("takeoffEpisodes",[]):
+                    ep_t=format_timeline_time(ep["startTimestamp"],base_t)
+                    label="Повторний зліт" if ep["number"]>1 else "Зліт"
+                    endtxt=""
+                    if ep.get("endTimestamp") is not None:
+                        et=format_timeline_time(ep["endTimestamp"],base_t)
+                        endtxt=f"; посадка {et} без DISARM" if ep.get("endReason")=="landed" else f"; завершення {et}"
+                    ai_alerts.append(
+                        f'<span class="ai-jump" data-jump-time="{ep_t}">'
+                        f"↗ <b>{label} — політ №{s['number']}, епізод {ep['number']}:</b> "
+                        f"{ep_t}{endtxt}; MAX ALT епізоду {float(ep.get('maxAltitude') or 0):.1f} м. "
+                        "Натисніть, щоб перейти до рядка Timeline.</span>"
+                    )
         # LAND behavior analysis.
         if land_analysis.get("available"):
             land_time = format_timeline_time(
@@ -3037,6 +3240,8 @@ async def analyze(file: UploadFile = File(...)):
                 "rpmDiagonalWarningThresholdPct": RPM_DIAGONAL_WARNING_PCT,
                 "rpmDropEventCount": len(rpm_drop_events),
                 "potentialThrustLossCount": len(potential_thrust_loss_events),
+                "flightSessionCount": len(flight_sessions),
+                "flightSessions": flight_sessions,
                 "landAnalysis": land_analysis,
                 "landParams": {
                     "LAND_SPEED": land_params.get("LAND_SPEED"),
