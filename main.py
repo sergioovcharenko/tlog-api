@@ -19,6 +19,16 @@ GROUND_ALTITUDE = 0.5
 RADIO_DROPOUT_CRITICAL_SEC = 2.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
 
+# Heading-based conditional antenna sector analysis.
+# IMPORTANT: VFR_HUD.heading is the aircraft heading, not the physical antenna azimuth.
+# This is therefore a heuristic/conditional sector, exactly as requested.
+ANTENNA_BEAM_WIDTH_DEG = 30.0
+ANTENNA_HALF_ANGLE_DEG = ANTENNA_BEAM_WIDTH_DEG / 2.0
+HEADING_REFERENCE_STABLE_TOLERANCE_DEG = 5.0
+HEADING_REFERENCE_MIN_DURATION_SEC = 10.0
+HEADING_OUTSIDE_CONFIRM_SEC = 3.0
+HEADING_SAMPLE_MAX_GAP_SEC = 1.6
+
 CH7_REVERSED = False
 CH8_REVERSED = False
 
@@ -41,6 +51,203 @@ def valid_number(value):
         return not math.isnan(value) and not math.isinf(value)
     except (TypeError, ValueError):
         return False
+
+
+def heading_difference_deg(a, b):
+    """Smallest absolute angular difference, 0..180 degrees."""
+    if not valid_number(a) or not valid_number(b):
+        return None
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
+def circular_mean_deg(values):
+    vals = [float(v) % 360.0 for v in values if valid_number(v)]
+    if not vals:
+        return None
+    s = sum(math.sin(math.radians(v)) for v in vals)
+    c = sum(math.cos(math.radians(v)) for v in vals)
+    if abs(s) < 1e-12 and abs(c) < 1e-12:
+        return vals[0]
+    return math.degrees(math.atan2(s, c)) % 360.0
+
+
+def format_timeline_time(timestamp, base_t):
+    elapsed = float(timestamp) - float(base_t)
+    sign = "-" if elapsed < 0 else ""
+    elapsed = abs(elapsed)
+    minutes = int(elapsed // 60)
+    seconds = elapsed - minutes * 60
+    return f"{sign}{minutes:02d}:{seconds:06.3f}"
+
+
+def analyze_heading_sector(raw_timeline, arm_timestamp):
+    """
+    Find the longest stable heading segment and use its circular mean as the
+    conditional antenna-sector center. Then identify confirmed excursions
+    outside +/-15 deg lasting at least HEADING_OUTSIDE_CONFIRM_SEC.
+    """
+    result = {
+        "available": False,
+        "reference": None,
+        "sectorMin": None,
+        "sectorMax": None,
+        "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
+        "halfAngle": ANTENNA_HALF_ANGLE_DEG,
+        "referenceDuration": 0.0,
+        "episodes": [],
+        "firstOutsideTimestamp": None,
+        "maxDeviation": 0.0,
+        "returnedToSector": False,
+    }
+
+    if arm_timestamp is None:
+        return result
+
+    # One-Hz snapshots are deliberately used so duplicate event rows do not
+    # artificially extend a stable/outside period.
+    samples = []
+    for ev in sorted(raw_timeline, key=lambda x: x.get("timestamp", 0)):
+        if ev.get("eventType") != "SNAPSHOT":
+            continue
+        ts = ev.get("timestamp")
+        hdg = ev.get("azimuth")
+        if ts is None or ts < arm_timestamp or not valid_number(hdg):
+            continue
+        samples.append((float(ts), float(hdg) % 360.0))
+
+    if len(samples) < 2:
+        return result
+
+    # Longest contiguous stable segment. A new sample must remain within the
+    # tolerance of the current circular mean.
+    best = []
+    current = [samples[0]]
+    for sample in samples[1:]:
+        ts, hdg = sample
+        prev_ts = current[-1][0]
+        mean = circular_mean_deg([h for _, h in current])
+        diff = heading_difference_deg(hdg, mean)
+        if (
+            ts - prev_ts <= HEADING_SAMPLE_MAX_GAP_SEC
+            and diff is not None
+            and diff <= HEADING_REFERENCE_STABLE_TOLERANCE_DEG
+        ):
+            current.append(sample)
+        else:
+            if len(current) > len(best):
+                best = current
+            current = [sample]
+    if len(current) > len(best):
+        best = current
+
+    if len(best) < 2:
+        return result
+
+    stable_duration = best[-1][0] - best[0][0]
+    if stable_duration < HEADING_REFERENCE_MIN_DURATION_SEC:
+        return result
+
+    reference = circular_mean_deg([h for _, h in best])
+    if reference is None:
+        return result
+
+    result["available"] = True
+    result["reference"] = round(reference, 1)
+    result["sectorMin"] = round((reference - ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
+    result["sectorMax"] = round((reference + ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
+    result["referenceDuration"] = round(stable_duration, 1)
+
+    # Detect confirmed outside-sector episodes on 1 Hz samples.
+    episodes = []
+    active = None
+    for ts, hdg in samples:
+        dev = heading_difference_deg(hdg, reference) or 0.0
+        outside = dev > ANTENNA_HALF_ANGLE_DEG
+
+        if outside:
+            if active is None:
+                active = {
+                    "start": ts,
+                    "end": ts,
+                    "firstHeading": hdg,
+                    "maxDeviation": dev,
+                    "maxHeading": hdg,
+                }
+            else:
+                # A large telemetry gap ends the previous episode.
+                if ts - active["end"] > HEADING_SAMPLE_MAX_GAP_SEC:
+                    duration = active["end"] - active["start"]
+                    if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
+                        active["duration"] = duration
+                        episodes.append(active)
+                    active = {
+                        "start": ts,
+                        "end": ts,
+                        "firstHeading": hdg,
+                        "maxDeviation": dev,
+                        "maxHeading": hdg,
+                    }
+                else:
+                    active["end"] = ts
+                    if dev > active["maxDeviation"]:
+                        active["maxDeviation"] = dev
+                        active["maxHeading"] = hdg
+        else:
+            if active is not None:
+                duration = active["end"] - active["start"]
+                if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
+                    active["duration"] = duration
+                    active["returned"] = True
+                    active["returnTimestamp"] = ts
+                    episodes.append(active)
+                active = None
+
+    if active is not None:
+        duration = active["end"] - active["start"]
+        if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
+            active["duration"] = duration
+            active["returned"] = False
+            active["returnTimestamp"] = None
+            episodes.append(active)
+
+    for ep in episodes:
+        ep.setdefault("returned", False)
+        ep.setdefault("returnTimestamp", None)
+        ep["start"] = float(ep["start"])
+        ep["end"] = float(ep["end"])
+        ep["duration"] = round(float(ep["duration"]), 1)
+        ep["firstHeading"] = round(float(ep["firstHeading"]), 1)
+        ep["maxHeading"] = round(float(ep["maxHeading"]), 1)
+        ep["maxDeviation"] = round(float(ep["maxDeviation"]), 1)
+
+    result["episodes"] = episodes
+    if episodes:
+        result["firstOutsideTimestamp"] = episodes[0]["start"]
+        result["maxDeviation"] = max(ep["maxDeviation"] for ep in episodes)
+        result["returnedToSector"] = all(ep.get("returned", False) for ep in episodes)
+
+    # Annotate every timeline row. Rows inside a confirmed episode become red
+    # in the HTML, including event rows that occur between the 1 Hz snapshots.
+    for ev in raw_timeline:
+        hdg = ev.get("azimuth")
+        ts = ev.get("timestamp")
+        if not valid_number(hdg) or ts is None:
+            ev["headingSector"] = None
+            continue
+
+        dev = heading_difference_deg(float(hdg), reference) or 0.0
+        confirmed = any(ep["start"] <= ts <= ep["end"] for ep in episodes)
+        ev["headingSector"] = {
+            "reference": round(reference, 1),
+            "sectorMin": result["sectorMin"],
+            "sectorMax": result["sectorMax"],
+            "deviation": round(dev, 1),
+            "outside": dev > ANTENNA_HALF_ANGLE_DEG,
+            "confirmedOutside": confirmed,
+            "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
+        }
+
+    return result
 
 
 def parse_dbm(raw_val):
@@ -1385,6 +1592,9 @@ async def analyze(file: UploadFile = File(...)):
 
         mins, secs = divmod(duration_sec, 60)
 
+        # Heading-based conditional antenna sector.
+        heading_sector = analyze_heading_sector(raw_timeline, arm_timestamp)
+
         # Timeline
         # 00:00.000 = момент ARM.
         # Події до ARM показуються з мінусом, наприклад -00:32.983.
@@ -1409,6 +1619,7 @@ async def analyze(file: UploadFile = File(...)):
                     "alt": ev["alt"],
                     "dist": ev["dist"],
                     "azimuth": ev.get("azimuth"),
+                    "headingSector": ev.get("headingSector"),
                     "vtxBand": ev["vtxBand"],
                     "vtxChannel": ev["vtxChannel"],
                     "videoFreq": ev["videoFreq"],
@@ -1683,6 +1894,49 @@ async def analyze(file: UploadFile = File(...)):
                         f"різниця між ESC становила {round(spread, 1)} °C."
                     )
 
+        # Conditional antenna sector by aircraft heading
+        if heading_sector.get("available"):
+            ref = heading_sector["reference"]
+            smin = heading_sector["sectorMin"]
+            smax = heading_sector["sectorMax"]
+            ref_dur = heading_sector["referenceDuration"]
+            episodes = heading_sector.get("episodes", [])
+
+            if episodes:
+                first = episodes[0]
+                first_time = format_timeline_time(first["start"], base_t)
+                max_ep = max(episodes, key=lambda x: x["maxDeviation"])
+                return_text = (
+                    "Heading надалі повертався в умовний сектор."
+                    if heading_sector.get("returnedToSector")
+                    else "До кінця зафіксованого епізоду повернення в сектор не підтверджено."
+                )
+                ai_alerts.append(
+                    "📡 <b>Ймовірний вихід за умовний сектор АС по Heading:</b> "
+                    f"стабільний базовий Heading {ref:.1f}° утримувався ~{ref_dur:.0f} с; "
+                    f"при розкритті {ANTENNA_BEAM_WIDTH_DEG:.0f}° умовний сектор "
+                    f"{smin:.1f}°–{smax:.1f}°. "
+                    f"Перший підтверджений вихід: {first_time}, Heading {first['firstHeading']:.1f}°, "
+                    f"тривалість {first['duration']:.1f} с. "
+                    f"Максимальне відхилення {max_ep['maxDeviation']:.1f}° "
+                    f"(Heading {max_ep['maxHeading']:.1f}°). {return_text} "
+                    "Це оцінка за курсом БПЛА, а не пряме вимірювання фізичного азимута антенної станції."
+                )
+            else:
+                ai_alerts.append(
+                    "✅ <b>Умовний сектор АС по Heading:</b> "
+                    f"базовий Heading {ref:.1f}° (стабільно ~{ref_dur:.0f} с), "
+                    f"сектор {smin:.1f}°–{smax:.1f}°. "
+                    f"Підтверджених виходів довше {HEADING_OUTSIDE_CONFIRM_SEC:.0f} с не зафіксовано."
+                )
+        elif ever_armed:
+            ai_alerts.append(
+                "ℹ️ <b>Умовний сектор АС по Heading не визначено:</b> "
+                f"не знайдено стабільного Heading тривалістю щонайменше "
+                f"{HEADING_REFERENCE_MIN_DURATION_SEC:.0f} с у межах "
+                f"±{HEADING_REFERENCE_STABLE_TOLERANCE_DEG:.0f}°."
+            )
+
         # Vibration
         if vibration_critical_events:
             is_critical = True
@@ -1798,6 +2052,17 @@ async def analyze(file: UploadFile = File(...)):
                 "loiterPositionFailCount": loiter_position_fail_count,
                 "externalNavRecoveryCount": external_nav_recovery_count,
                 "smartRtlBadPositionCount": smart_rtl_bad_position_count,
+                "headingSector": {
+                    "available": heading_sector.get("available", False),
+                    "reference": heading_sector.get("reference"),
+                    "sectorMin": heading_sector.get("sectorMin"),
+                    "sectorMax": heading_sector.get("sectorMax"),
+                    "beamWidth": heading_sector.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG),
+                    "referenceDuration": heading_sector.get("referenceDuration", 0.0),
+                    "episodeCount": len(heading_sector.get("episodes", [])),
+                    "maxDeviation": heading_sector.get("maxDeviation", 0.0),
+                    "returnedToSector": heading_sector.get("returnedToSector", False),
+                },
                 "alerts": ai_alerts,
             },
             "flight": {
