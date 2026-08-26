@@ -37,6 +37,15 @@ RPM_CRITICAL_PERSIST_SEC = 0.8
 RPM_THRUST_CORRELATION_SEC = 3.0
 MECHANICAL_CORRELATION_SEC = 2.5
 
+# LAND diagnostics.
+# ArduPilot LAND_SPEED / LAND_SPEED_HIGH are stored in cm/s,
+# LAND_ALT_LOW in cm.
+LAND_SPEED_TOLERANCE_MPS = 1.0
+LAND_SPEED_RATIO_WARNING = 1.35
+LAND_SPEED_MIN_ABNORMAL_MPS = 1.5
+LAND_FREEFALL_ACCEL_MPS2 = 2.5
+LAND_ANALYSIS_MIN_SAMPLES = 5
+
 # Antenna-station inference from the TLOG.
 # IMPORTANT: this is an estimate, not a direct measurement of antenna azimuth.
 # It assumes LOCAL_POSITION_NED origin is at/near the antenna station.
@@ -587,6 +596,17 @@ async def analyze(file: UploadFile = File(...)):
         curr_amp = 0.0
         curr_rssi_pct = 0
         curr_dbm = 0
+        curr_vertical_speed_down = None
+
+        # LAND analysis
+        land_params = {
+            "LAND_SPEED": None,
+            "LAND_SPEED_HIGH": None,
+            "LAND_ALT_LOW": None,
+        }
+        land_entries = []
+        active_land_entry = None
+        land_samples = []
 
         # Attitude (ATTITUDE message)
         curr_roll = None
@@ -891,6 +911,7 @@ async def analyze(file: UploadFile = File(...)):
                     "vibration": vibration_snapshot(),
                     "attitude": attitude_snapshot(),
                     "rpmAnalysis": rpm_analysis_snapshot(),
+                    "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "system_text": "" if is_pilot_action else text,
                     "pilot_text": text if is_pilot_action else "",
                     "eventType": event_type,
@@ -932,6 +953,7 @@ async def analyze(file: UploadFile = File(...)):
                     "vibration": vibration_snapshot(),
                     "attitude": attitude_snapshot(),
                     "rpmAnalysis": rpm_analysis_snapshot(),
+                    "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "system_text": "",
                     "pilot_text": "",
                     "eventType": "SNAPSHOT",
@@ -1081,7 +1103,7 @@ async def analyze(file: UploadFile = File(...)):
             "RADIO", "RADIO_STATUS", "ATTITUDE", "VIBRATION",
             "TEMPERATURE", "HIGHRES_IMU", "SCALED_PRESSURE",
             "SCALED_PRESSURE2", "SCALED_PRESSURE3", "MCU_STATUS",
-            "STATUSTEXT", "ESC_TELEMETRY_1_TO_4",
+            "STATUSTEXT", "ESC_TELEMETRY_1_TO_4", "PARAM_VALUE",
         ]
 
         while True:
@@ -1136,6 +1158,12 @@ async def analyze(file: UploadFile = File(...)):
 
                         if current_mode == "LAND":
                             land_mode_triggered = True
+                            active_land_entry = {
+                                "timestamp": current_timestamp,
+                                "altitude": float(curr_alt) if valid_number(curr_alt) else None,
+                                "modeBefore": None,
+                            }
+                            land_entries.append(active_land_entry)
 
                     if is_armed and not was_armed:
                         ever_armed = True
@@ -1176,6 +1204,24 @@ async def analyze(file: UploadFile = File(...)):
                         )
 
                         was_armed = False
+
+
+            # PARAMETERS used for LAND diagnostics.
+            elif msg_type == "PARAM_VALUE":
+                try:
+                    raw_param_id = getattr(msg, "param_id", "")
+                    if isinstance(raw_param_id, bytes):
+                        param_id = raw_param_id.decode("utf-8", errors="ignore")
+                    else:
+                        param_id = str(raw_param_id)
+                    param_id = param_id.strip("\x00 ").upper()
+
+                    if param_id in land_params:
+                        value = getattr(msg, "param_value", None)
+                        if valid_number(value):
+                            land_params[param_id] = float(value)
+                except Exception:
+                    pass
 
             # SYS_STATUS
             elif msg_type == "SYS_STATUS":
@@ -1316,6 +1362,28 @@ async def analyze(file: UploadFile = File(...)):
                             ) % 360.0
 
                     ned_alt = -z
+
+                    vz = getattr(msg, "vz", None)
+                    if valid_number(vz):
+                        # LOCAL_POSITION_NED vz is positive downward in NED.
+                        curr_vertical_speed_down = float(vz)
+
+                    if current_mode == "LAND" and is_currently_armed:
+                        land_samples.append({
+                            "timestamp": current_timestamp,
+                            "altitude": max(0.0, float(ned_alt)) if valid_number(ned_alt) else None,
+                            "verticalSpeedDown": float(curr_vertical_speed_down) if valid_number(curr_vertical_speed_down) else None,
+                            "roll": float(curr_roll) if valid_number(curr_roll) else None,
+                            "pitch": float(curr_pitch) if valid_number(curr_pitch) else None,
+                            "vibration": vibration_snapshot(),
+                            "rpmAnalysis": rpm_analysis_snapshot(),
+                            "rpms": [
+                                int(round(v)) if valid_number(v) else None
+                                for v in esc_rpm_current
+                            ],
+                            "curr": float(curr_amp) if valid_number(curr_amp) else None,
+                            "volt": float(curr_voltage) if valid_number(curr_voltage) else None,
+                        })
 
                     if -1000.0 <= ned_alt <= 1000.0:
                         local_rel_alt = max(
@@ -1989,6 +2057,235 @@ async def analyze(file: UploadFile = File(...)):
             attitude_critical_active = False
             attitude_critical_peak = None
 
+
+        # ====================================================
+        # LAND ANALYSIS
+        # ====================================================
+        land_analysis = {
+            "available": False,
+            "classification": "NO_DATA",
+            "entryTimestamp": None,
+            "entryAltitude": None,
+            "maxDescentRate": None,
+            "maxDescentTimestamp": None,
+            "meanDescentRate": None,
+            "expectedHighSpeed": None,
+            "expectedLowSpeed": None,
+            "lowAltitudeThreshold": None,
+            "matchesConfiguredSpeed": False,
+            "abnormalDescent": False,
+            "possibleFreeFall": False,
+            "notes": [],
+        }
+
+        if land_entries and len(land_samples) >= LAND_ANALYSIS_MIN_SAMPLES:
+            entry = land_entries[0]
+            entry_ts = entry.get("timestamp")
+            relevant = [
+                s for s in land_samples
+                if entry_ts is None or s.get("timestamp", 0) >= entry_ts
+            ]
+
+            valid_vs = [
+                s for s in relevant
+                if valid_number(s.get("verticalSpeedDown"))
+                and valid_number(s.get("altitude"))
+            ]
+
+            if valid_vs:
+                land_analysis["available"] = True
+                land_analysis["entryTimestamp"] = entry_ts
+                land_analysis["entryAltitude"] = (
+                    round(float(entry.get("altitude")), 1)
+                    if valid_number(entry.get("altitude"))
+                    else round(float(valid_vs[0]["altitude"]), 1)
+                )
+
+                max_s = max(valid_vs, key=lambda s: float(s["verticalSpeedDown"]))
+                max_vs = max(0.0, float(max_s["verticalSpeedDown"]))
+                land_analysis["maxDescentRate"] = round(max_vs, 2)
+                land_analysis["maxDescentTimestamp"] = max_s["timestamp"]
+
+                positive_rates = [
+                    max(0.0, float(s["verticalSpeedDown"]))
+                    for s in valid_vs
+                    if float(s["verticalSpeedDown"]) > 0
+                ]
+                if positive_rates:
+                    land_analysis["meanDescentRate"] = round(
+                        sum(positive_rates) / len(positive_rates), 2
+                    )
+
+                land_speed = land_params.get("LAND_SPEED")
+                land_speed_high = land_params.get("LAND_SPEED_HIGH")
+                land_alt_low = land_params.get("LAND_ALT_LOW")
+
+                low_speed_mps = (
+                    float(land_speed) / 100.0
+                    if valid_number(land_speed) and float(land_speed) > 0
+                    else None
+                )
+                high_speed_mps = (
+                    float(land_speed_high) / 100.0
+                    if valid_number(land_speed_high) and float(land_speed_high) > 0
+                    else None
+                )
+                low_alt_m = (
+                    float(land_alt_low) / 100.0
+                    if valid_number(land_alt_low) and float(land_alt_low) >= 0
+                    else None
+                )
+
+                land_analysis["expectedLowSpeed"] = (
+                    round(low_speed_mps, 2) if low_speed_mps is not None else None
+                )
+                land_analysis["expectedHighSpeed"] = (
+                    round(high_speed_mps, 2) if high_speed_mps is not None else None
+                )
+                land_analysis["lowAltitudeThreshold"] = (
+                    round(low_alt_m, 1) if low_alt_m is not None else None
+                )
+
+                # Compare actual descent to the configured phase speed sample-by-sample.
+                comparisons = []
+                for s in valid_vs:
+                    alt = float(s["altitude"])
+                    actual = max(0.0, float(s["verticalSpeedDown"]))
+                    expected = None
+
+                    if (
+                        high_speed_mps is not None
+                        and low_alt_m is not None
+                        and alt > low_alt_m
+                    ):
+                        expected = high_speed_mps
+                    elif low_speed_mps is not None:
+                        expected = low_speed_mps
+                    elif high_speed_mps is not None:
+                        expected = high_speed_mps
+
+                    if expected is not None and expected > 0:
+                        comparisons.append((s, actual, expected))
+
+                if comparisons:
+                    within = [
+                        abs(actual - expected) <= LAND_SPEED_TOLERANCE_MPS
+                        for _, actual, expected in comparisons
+                    ]
+                    match_fraction = sum(within) / len(within)
+                    land_analysis["matchesConfiguredSpeed"] = match_fraction >= 0.60
+
+                    abnormal = [
+                        (s, actual, expected)
+                        for s, actual, expected in comparisons
+                        if (
+                            actual >= LAND_SPEED_MIN_ABNORMAL_MPS
+                            and actual > expected * LAND_SPEED_RATIO_WARNING
+                            and (actual - expected) > LAND_SPEED_TOLERANCE_MPS
+                        )
+                    ]
+
+                    if abnormal:
+                        land_analysis["abnormalDescent"] = True
+                        worst = max(
+                            abnormal,
+                            key=lambda x: x[1] - x[2],
+                        )
+                        land_analysis["worstUnexpectedTimestamp"] = worst[0]["timestamp"]
+                        land_analysis["worstUnexpectedActual"] = round(worst[1], 2)
+                        land_analysis["worstUnexpectedExpected"] = round(worst[2], 2)
+
+                # Approximate free-fall-like acceleration check:
+                # rapidly increasing downward speed is different from a controller
+                # settling onto a near-constant commanded descent speed.
+                accel_peaks = []
+                prev = None
+                for s in valid_vs:
+                    if prev is not None:
+                        dt = s["timestamp"] - prev["timestamp"]
+                        if dt > 0.03:
+                            dv = (
+                                float(s["verticalSpeedDown"])
+                                - float(prev["verticalSpeedDown"])
+                            )
+                            accel_peaks.append(dv / dt)
+                    prev = s
+
+                max_down_accel = max(accel_peaks) if accel_peaks else 0.0
+                land_analysis["maxDownAcceleration"] = round(max_down_accel, 2)
+
+                if (
+                    land_analysis["abnormalDescent"]
+                    and max_down_accel >= LAND_FREEFALL_ACCEL_MPS2
+                ):
+                    land_analysis["possibleFreeFall"] = True
+
+                if land_analysis["matchesConfiguredSpeed"]:
+                    land_analysis["classification"] = "CONTROLLED_FAST_LAND"
+                    land_analysis["notes"].append(
+                        "Фактична швидкість зниження переважно відповідає "
+                        "параметрам LAND."
+                    )
+                elif land_analysis["abnormalDescent"]:
+                    land_analysis["classification"] = "ABNORMAL_LAND_DESCENT"
+                    land_analysis["notes"].append(
+                        "Фактична швидкість зниження суттєво перевищує "
+                        "розрахункову швидкість LAND."
+                    )
+                else:
+                    land_analysis["classification"] = "LAND_UNCERTAIN"
+
+                # Add one exact timeline marker for the most informative LAND point.
+                marker_ts = (
+                    land_analysis.get("worstUnexpectedTimestamp")
+                    if land_analysis["abnormalDescent"]
+                    else land_analysis.get("maxDescentTimestamp")
+                )
+
+                if marker_ts is not None:
+                    nearest = min(
+                        valid_vs,
+                        key=lambda s: abs(s["timestamp"] - marker_ts),
+                    )
+                    marker_actual = max(
+                        0.0,
+                        float(nearest.get("verticalSpeedDown") or 0.0),
+                    )
+                    marker_alt = float(nearest.get("altitude") or 0.0)
+
+                    if land_analysis["abnormalDescent"]:
+                        marker_text = (
+                            f"🚨 Аномальне зниження в LAND: "
+                            f"{marker_actual:.2f} м/с вниз на висоті "
+                            f"{marker_alt:.1f} м"
+                        )
+                        marker_type = "LAND_DESCENT_ABNORMAL"
+                        marker_error = True
+                    else:
+                        marker_text = (
+                            f"🛬 LAND: максимальна швидкість зниження "
+                            f"{marker_actual:.2f} м/с на висоті "
+                            f"{marker_alt:.1f} м"
+                        )
+                        marker_type = "LAND_DESCENT_CONTROLLED"
+                        marker_error = False
+
+                    # Temporarily restore sample values so the row contains
+                    # telemetry close to the derived event timestamp.
+                    old_alt = curr_alt
+                    old_vz = curr_vertical_speed_down
+                    curr_alt = marker_alt
+                    curr_vertical_speed_down = marker_actual
+                    add_event(
+                        marker_text,
+                        marker_ts,
+                        "LAND",
+                        is_error=marker_error,
+                        event_type=marker_type,
+                    )
+                    curr_alt = old_alt
+                    curr_vertical_speed_down = old_vz
+
         # Estimate antenna pointing from NED position azimuth + dBm.
         antenna_analysis = analyze_antenna_direction(raw_timeline, arm_timestamp)
 
@@ -2032,6 +2329,7 @@ async def analyze(file: UploadFile = File(...)):
                     "vibration": ev.get("vibration"),
                     "attitude": ev.get("attitude"),
                     "rpmAnalysis": ev.get("rpmAnalysis"),
+                    "verticalSpeedDown": ev.get("verticalSpeedDown"),
                     "systemText": ev["system_text"],
                     "pilotText": ev["pilot_text"],
                     "eventType": ev["eventType"],
@@ -2078,6 +2376,84 @@ async def analyze(file: UploadFile = File(...)):
                     "ℹ️ <b>DISARM:</b> зафіксовано вимкнення двигунів "
                     f"у режимі {disarm_mode or current_mode}. "
                     "Автоматичну посадку LAND за цим DISARM не підтверджено."
+                )
+
+
+        # LAND behavior analysis.
+        if land_analysis.get("available"):
+            land_time = format_timeline_time(
+                land_analysis.get("maxDescentTimestamp"),
+                base_t,
+            )
+            entry_alt = land_analysis.get("entryAltitude")
+            max_rate = land_analysis.get("maxDescentRate")
+            high_speed = land_analysis.get("expectedHighSpeed")
+            low_speed = land_analysis.get("expectedLowSpeed")
+            low_alt = land_analysis.get("lowAltitudeThreshold")
+
+            params_text = []
+            if high_speed is not None:
+                params_text.append(f"LAND_SPEED_HIGH ≈ {high_speed:.2f} м/с")
+            if low_speed is not None:
+                params_text.append(f"LAND_SPEED ≈ {low_speed:.2f} м/с")
+            if low_alt is not None:
+                params_text.append(f"LAND_ALT_LOW ≈ {low_alt:.1f} м")
+            params_joined = "; ".join(params_text) if params_text else "параметри LAND у TLOG не знайдені"
+
+            if land_analysis.get("classification") == "CONTROLLED_FAST_LAND":
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{land_time}">'
+                    "🛬 <b>LAND — кероване швидке зниження:</b> "
+                    + (
+                        f"режим LAND активовано приблизно на висоті {entry_alt:.1f} м. "
+                        if entry_alt is not None else ""
+                    )
+                    + f"Максимальна фактична швидкість зниження — {max_rate:.2f} м/с. "
+                    + f"{params_joined}. "
+                    + "Форма зниження переважно відповідає заданій швидкості LAND; "
+                    + "ознак вільного падіння лише за профілем вертикальної швидкості не підтверджено. "
+                    + "Натисніть, щоб перейти до найбільш показового рядка Timeline."
+                    "</span>"
+                )
+            elif land_analysis.get("classification") == "ABNORMAL_LAND_DESCENT":
+                bad_time = format_timeline_time(
+                    land_analysis.get("worstUnexpectedTimestamp")
+                    or land_analysis.get("maxDescentTimestamp"),
+                    base_t,
+                )
+                actual = land_analysis.get("worstUnexpectedActual") or max_rate
+                expected = land_analysis.get("worstUnexpectedExpected")
+
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{bad_time}">'
+                    "🚨 <b>Аномальна втрата висоти в LAND:</b> "
+                    + (
+                        f"фактична швидкість досягла {actual:.2f} м/с "
+                        if actual is not None else ""
+                    )
+                    + (
+                        f"при розрахунковій швидкості близько {expected:.2f} м/с. "
+                        if expected is not None else ""
+                    )
+                    + f"{params_joined}. "
+                    + (
+                        "Профіль має ознаки швидкого наростання вертикальної швидкості; "
+                        if land_analysis.get("possibleFreeFall") else ""
+                    )
+                    + "Потрібна кореляція з RPM, ATT, VIB, напругою та струмом для відокремлення "
+                    + "проблеми силової установки від помилки налаштування або оцінки висоти. "
+                    + "Натисніть, щоб перейти до критичного рядка Timeline."
+                    "</span>"
+                )
+                is_critical = True
+            else:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{land_time}">'
+                    "ℹ️ <b>LAND:</b> режим і вертикальне зниження зафіксовані, "
+                    "але даних недостатньо для впевненої класифікації як штатного "
+                    "або аномального профілю. "
+                    + f"{params_joined}."
+                    "</span>"
                 )
 
         # Primary false coordinates around first LOITER.
@@ -2661,6 +3037,12 @@ async def analyze(file: UploadFile = File(...)):
                 "rpmDiagonalWarningThresholdPct": RPM_DIAGONAL_WARNING_PCT,
                 "rpmDropEventCount": len(rpm_drop_events),
                 "potentialThrustLossCount": len(potential_thrust_loss_events),
+                "landAnalysis": land_analysis,
+                "landParams": {
+                    "LAND_SPEED": land_params.get("LAND_SPEED"),
+                    "LAND_SPEED_HIGH": land_params.get("LAND_SPEED_HIGH"),
+                    "LAND_ALT_LOW": land_params.get("LAND_ALT_LOW"),
+                },
                 "modes": modes_str,
                 "msgCount": message_count,
                 "altitudeSource": altitude_source,
