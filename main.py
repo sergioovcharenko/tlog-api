@@ -17,17 +17,18 @@ MAX_ALTITUDE = 1000.0
 MAX_CLIMB_RATE = 50.0
 GROUND_ALTITUDE = 0.5
 RADIO_DROPOUT_CRITICAL_SEC = 2.0
+RADIO_LONG_LOSS_SEC = 60.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
 
-# Heading-based conditional antenna sector analysis.
-# IMPORTANT: VFR_HUD.heading is the aircraft heading, not the physical antenna azimuth.
-# This is therefore a heuristic/conditional sector, exactly as requested.
+# Antenna-station inference from the TLOG.
+# IMPORTANT: this is an estimate, not a direct measurement of antenna azimuth.
+# It assumes LOCAL_POSITION_NED origin is at/near the antenna station.
 ANTENNA_BEAM_WIDTH_DEG = 30.0
 ANTENNA_HALF_ANGLE_DEG = ANTENNA_BEAM_WIDTH_DEG / 2.0
-HEADING_REFERENCE_STABLE_TOLERANCE_DEG = 5.0
-HEADING_REFERENCE_MIN_DURATION_SEC = 10.0
-HEADING_OUTSIDE_CONFIRM_SEC = 3.0
-HEADING_SAMPLE_MAX_GAP_SEC = 1.6
+ANTENNA_MIN_DISTANCE_M = 10.0
+ANTENNA_MIN_RADIO_SAMPLES = 15
+ANTENNA_TOP_SIGNAL_FRACTION = 0.30
+ANTENNA_SAMPLE_MAX_GAP_SEC = 2.2
 
 CH7_REVERSED = False
 CH8_REVERSED = False
@@ -80,175 +81,220 @@ def format_timeline_time(timestamp, base_t):
     return f"{sign}{minutes:02d}:{seconds:06.3f}"
 
 
-def analyze_heading_sector(raw_timeline, arm_timestamp):
+def analyze_antenna_direction(raw_timeline, arm_timestamp):
     """
-    Find the longest stable heading segment and use its circular mean as the
-    conditional antenna-sector center. Then identify confirmed excursions
-    outside +/-15 deg lasting at least HEADING_OUTSIDE_CONFIRM_SEC.
+    Estimate the antenna-station pointing direction from:
+      * geometric azimuth of the aircraft from LOCAL_POSITION_NED;
+      * RADIO/RADIO_STATUS dBm;
+      * distance from NED origin.
+
+    Distance is approximately compensated with +20*log10(distance) so close
+    samples do not automatically look better only because the aircraft is near.
+
+    A probable sector-exit event is reported only when a continuous -128 dBm
+    period lasts >= RADIO_LONG_LOSS_SEC and the aircraft position azimuth is
+    outside the inferred +/-15 degree sector for most of that period.
     """
     result = {
         "available": False,
-        "reference": None,
+        "center": None,
         "sectorMin": None,
         "sectorMax": None,
         "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
         "halfAngle": ANTENNA_HALF_ANGLE_DEG,
-        "referenceDuration": 0.0,
-        "episodes": [],
-        "firstOutsideTimestamp": None,
+        "confidence": 0,
+        "radioSampleCount": 0,
+        "longLossEpisodes": [],
+        "probableSectorExitCount": 0,
+        "firstProbableExitTimestamp": None,
         "maxDeviation": 0.0,
-        "returnedToSector": False,
     }
 
     if arm_timestamp is None:
         return result
 
-    # One-Hz snapshots are deliberately used so duplicate event rows do not
-    # artificially extend a stable/outside period.
-    samples = []
+    snapshots = []
     for ev in sorted(raw_timeline, key=lambda x: x.get("timestamp", 0)):
         if ev.get("eventType") != "SNAPSHOT":
             continue
         ts = ev.get("timestamp")
-        hdg = ev.get("azimuth")
-        if ts is None or ts < arm_timestamp or not valid_number(hdg):
+        pos_az = ev.get("positionAzimuth")
+        dist = ev.get("distValue")
+        dbm = ev.get("dbm")
+        if ts is None or float(ts) < arm_timestamp:
             continue
-        samples.append((float(ts), float(hdg) % 360.0))
+        snapshots.append({
+            "timestamp": float(ts),
+            "positionAzimuth": float(pos_az) % 360.0 if valid_number(pos_az) else None,
+            "distance": float(dist) if valid_number(dist) else None,
+            "dbm": float(dbm) if valid_number(dbm) else None,
+        })
 
-    if len(samples) < 2:
-        return result
+    # 1) Estimate antenna center from valid (non -128) radio samples.
+    scored = []
+    for s in snapshots:
+        az = s["positionAzimuth"]
+        dist = s["distance"]
+        dbm = s["dbm"]
+        if az is None or dist is None or dbm is None:
+            continue
+        if dist < ANTENNA_MIN_DISTANCE_M or dbm <= -128 or dbm >= 0:
+            continue
+        corrected = dbm + 20.0 * math.log10(max(dist, 1.0))
+        scored.append((corrected, az, dbm, dist, s["timestamp"]))
 
-    # Longest contiguous stable segment. A new sample must remain within the
-    # tolerance of the current circular mean.
-    best = []
-    current = [samples[0]]
-    for sample in samples[1:]:
-        ts, hdg = sample
-        prev_ts = current[-1][0]
-        mean = circular_mean_deg([h for _, h in current])
-        diff = heading_difference_deg(hdg, mean)
-        if (
-            ts - prev_ts <= HEADING_SAMPLE_MAX_GAP_SEC
-            and diff is not None
-            and diff <= HEADING_REFERENCE_STABLE_TOLERANCE_DEG
-        ):
-            current.append(sample)
-        else:
-            if len(current) > len(best):
-                best = current
-            current = [sample]
-    if len(current) > len(best):
-        best = current
+    result["radioSampleCount"] = len(scored)
 
-    if len(best) < 2:
-        return result
+    reference = None
+    if len(scored) >= ANTENNA_MIN_RADIO_SAMPLES:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_n = max(
+            ANTENNA_MIN_RADIO_SAMPLES,
+            int(math.ceil(len(scored) * ANTENNA_TOP_SIGNAL_FRACTION)),
+        )
+        top = scored[:min(top_n, len(scored))]
 
-    stable_duration = best[-1][0] - best[0][0]
-    if stable_duration < HEADING_REFERENCE_MIN_DURATION_SEC:
-        return result
+        min_score = min(x[0] for x in top)
+        weights = [(x[0] - min_score) + 1.0 for x in top]
+        sin_sum = sum(w * math.sin(math.radians(x[1])) for w, x in zip(weights, top))
+        cos_sum = sum(w * math.cos(math.radians(x[1])) for w, x in zip(weights, top))
+        reference = math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
 
-    reference = circular_mean_deg([h for _, h in best])
-    if reference is None:
-        return result
+        wsum = sum(weights) or 1.0
+        resultant = math.sqrt(sin_sum * sin_sum + cos_sum * cos_sum) / wsum
+        # Confidence is intentionally conservative: angular concentration + data volume.
+        sample_factor = min(1.0, len(scored) / 60.0)
+        confidence = int(round(max(0.0, min(1.0, resultant * sample_factor)) * 100.0))
 
-    result["available"] = True
-    result["reference"] = round(reference, 1)
-    result["sectorMin"] = round((reference - ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
-    result["sectorMax"] = round((reference + ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
-    result["referenceDuration"] = round(stable_duration, 1)
+        result["available"] = True
+        result["center"] = round(reference, 1)
+        result["sectorMin"] = round((reference - ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
+        result["sectorMax"] = round((reference + ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
+        result["confidence"] = confidence
 
-    # Detect confirmed outside-sector episodes on 1 Hz samples.
-    episodes = []
+    # 2) Find continuous -128 dBm episodes lasting >= 60 s.
+    long_episodes = []
     active = None
-    for ts, hdg in samples:
-        dev = heading_difference_deg(hdg, reference) or 0.0
-        outside = dev > ANTENNA_HALF_ANGLE_DEG
 
-        if outside:
+    def close_episode(ep, recovered, recovery_ts=None):
+        if ep is None:
+            return
+        duration = ep["end"] - ep["start"]
+        if duration < RADIO_LONG_LOSS_SEC:
+            return
+
+        pos_samples = ep["positionSamples"]
+        outside_samples = 0
+        max_dev = 0.0
+        first_az = None
+        if reference is not None:
+            for _, az in pos_samples:
+                dev = heading_difference_deg(az, reference) or 0.0
+                if first_az is None:
+                    first_az = az
+                if dev > ANTENNA_HALF_ANGLE_DEG:
+                    outside_samples += 1
+                max_dev = max(max_dev, dev)
+
+        outside_fraction = (
+            outside_samples / len(pos_samples)
+            if pos_samples and reference is not None
+            else 0.0
+        )
+        probable_exit = (
+            reference is not None
+            and len(pos_samples) >= 10
+            and outside_fraction >= 0.60
+        )
+
+        long_episodes.append({
+            "start": ep["start"],
+            "end": ep["end"],
+            "duration": round(duration, 1),
+            "recovered": bool(recovered),
+            "recoveryTimestamp": recovery_ts,
+            "firstPositionAzimuth": round(first_az, 1) if first_az is not None else None,
+            "outsideFraction": round(outside_fraction, 2),
+            "maxDeviation": round(max_dev, 1),
+            "probableSectorExit": probable_exit,
+        })
+
+    for s in snapshots:
+        ts = s["timestamp"]
+        dbm = s["dbm"]
+        is_bad = dbm is not None and dbm <= -128
+
+        if is_bad:
             if active is None:
                 active = {
                     "start": ts,
                     "end": ts,
-                    "firstHeading": hdg,
-                    "maxDeviation": dev,
-                    "maxHeading": hdg,
+                    "positionSamples": [],
                 }
-            else:
-                # A large telemetry gap ends the previous episode.
-                if ts - active["end"] > HEADING_SAMPLE_MAX_GAP_SEC:
-                    duration = active["end"] - active["start"]
-                    if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
-                        active["duration"] = duration
-                        episodes.append(active)
-                    active = {
-                        "start": ts,
-                        "end": ts,
-                        "firstHeading": hdg,
-                        "maxDeviation": dev,
-                        "maxHeading": hdg,
-                    }
-                else:
-                    active["end"] = ts
-                    if dev > active["maxDeviation"]:
-                        active["maxDeviation"] = dev
-                        active["maxHeading"] = hdg
+            elif ts - active["end"] > ANTENNA_SAMPLE_MAX_GAP_SEC:
+                close_episode(active, False, None)
+                active = {
+                    "start": ts,
+                    "end": ts,
+                    "positionSamples": [],
+                }
+            active["end"] = ts
+            if s["positionAzimuth"] is not None:
+                active["positionSamples"].append((ts, s["positionAzimuth"]))
         else:
             if active is not None:
-                duration = active["end"] - active["start"]
-                if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
-                    active["duration"] = duration
-                    active["returned"] = True
-                    active["returnTimestamp"] = ts
-                    episodes.append(active)
+                close_episode(active, True, ts)
                 active = None
 
     if active is not None:
-        duration = active["end"] - active["start"]
-        if duration >= HEADING_OUTSIDE_CONFIRM_SEC:
-            active["duration"] = duration
-            active["returned"] = False
-            active["returnTimestamp"] = None
-            episodes.append(active)
+        close_episode(active, False, None)
 
-    for ep in episodes:
-        ep.setdefault("returned", False)
-        ep.setdefault("returnTimestamp", None)
-        ep["start"] = float(ep["start"])
-        ep["end"] = float(ep["end"])
-        ep["duration"] = round(float(ep["duration"]), 1)
-        ep["firstHeading"] = round(float(ep["firstHeading"]), 1)
-        ep["maxHeading"] = round(float(ep["maxHeading"]), 1)
-        ep["maxDeviation"] = round(float(ep["maxDeviation"]), 1)
+    result["longLossEpisodes"] = long_episodes
+    probable = [x for x in long_episodes if x["probableSectorExit"]]
+    result["probableSectorExitCount"] = len(probable)
+    if probable:
+        result["firstProbableExitTimestamp"] = probable[0]["start"]
+        result["maxDeviation"] = max(x["maxDeviation"] for x in probable)
 
-    result["episodes"] = episodes
-    if episodes:
-        result["firstOutsideTimestamp"] = episodes[0]["start"]
-        result["maxDeviation"] = max(ep["maxDeviation"] for ep in episodes)
-        result["returnedToSector"] = all(ep.get("returned", False) for ep in episodes)
-
-    # Annotate every timeline row. Rows inside a confirmed episode become red
-    # in the HTML, including event rows that occur between the 1 Hz snapshots.
+    # 3) Annotate rows. Red only when the confirmed long -128 episode and the
+    # geometric azimuth are both outside the inferred sector.
     for ev in raw_timeline:
-        hdg = ev.get("azimuth")
         ts = ev.get("timestamp")
-        if not valid_number(hdg) or ts is None:
-            ev["headingSector"] = None
+        pos_az = ev.get("positionAzimuth")
+        dbm = ev.get("dbm")
+        if ts is None:
+            ev["antennaSector"] = None
             continue
 
-        dev = heading_difference_deg(float(hdg), reference) or 0.0
-        confirmed = any(ep["start"] <= ts <= ep["end"] for ep in episodes)
-        ev["headingSector"] = {
-            "reference": round(reference, 1),
+        episode = next((x for x in long_episodes if x["start"] <= ts <= x["end"]), None)
+        dev = None
+        outside = False
+        if reference is not None and valid_number(pos_az):
+            dev = heading_difference_deg(float(pos_az), reference)
+            outside = dev is not None and dev > ANTENNA_HALF_ANGLE_DEG
+
+        probable_here = bool(
+            episode
+            and episode.get("probableSectorExit")
+            and outside
+            and valid_number(dbm)
+            and float(dbm) <= -128
+        )
+
+        ev["antennaSector"] = {
+            "available": result["available"],
+            "center": result["center"],
             "sectorMin": result["sectorMin"],
             "sectorMax": result["sectorMax"],
-            "deviation": round(dev, 1),
-            "outside": dev > ANTENNA_HALF_ANGLE_DEG,
-            "confirmedOutside": confirmed,
+            "positionAzimuth": round(float(pos_az), 1) if valid_number(pos_az) else None,
+            "deviation": round(float(dev), 1) if dev is not None else None,
+            "outside": outside,
+            "longLoss": episode is not None,
+            "probableSectorExit": probable_here,
             "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
         }
 
     return result
-
 
 def parse_dbm(raw_val):
     if raw_val is None:
@@ -448,7 +494,8 @@ async def analyze(file: UploadFile = File(...)):
 
         # Current state
         curr_dist = 0.0
-        curr_azimuth = None
+        curr_azimuth = None  # aircraft Heading from VFR_HUD
+        curr_position_azimuth = None  # geometric NED azimuth from origin to aircraft
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -638,7 +685,9 @@ async def analyze(file: UploadFile = File(...)):
                     "mode": mode,
                     "alt": f"{round(curr_alt, 1)} м",
                     "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
+                    "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
+                    "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -675,7 +724,9 @@ async def analyze(file: UploadFile = File(...)):
                     "mode": current_mode,
                     "alt": f"{round(curr_alt, 1)} м",
                     "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
+                    "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
+                    "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1047,7 +1098,10 @@ async def analyze(file: UploadFile = File(...)):
                             max_dist,
                             curr_dist,
                         )
-
+                        if d_val >= 0.5:
+                            curr_position_azimuth = (
+                                math.degrees(math.atan2(y, x)) + 360.0
+                            ) % 360.0
 
                     ned_alt = -z
 
@@ -1592,8 +1646,8 @@ async def analyze(file: UploadFile = File(...)):
 
         mins, secs = divmod(duration_sec, 60)
 
-        # Heading-based conditional antenna sector.
-        heading_sector = analyze_heading_sector(raw_timeline, arm_timestamp)
+        # Estimate antenna pointing from NED position azimuth + dBm.
+        antenna_analysis = analyze_antenna_direction(raw_timeline, arm_timestamp)
 
         # Timeline
         # 00:00.000 = момент ARM.
@@ -1619,7 +1673,8 @@ async def analyze(file: UploadFile = File(...)):
                     "alt": ev["alt"],
                     "dist": ev["dist"],
                     "azimuth": ev.get("azimuth"),
-                    "headingSector": ev.get("headingSector"),
+                    "positionAzimuth": ev.get("positionAzimuth"),
+                    "antennaSector": ev.get("antennaSector"),
                     "vtxBand": ev["vtxBand"],
                     "vtxChannel": ev["vtxChannel"],
                     "videoFreq": ev["videoFreq"],
@@ -1894,82 +1949,60 @@ async def analyze(file: UploadFile = File(...)):
                         f"різниця між ESC становила {round(spread, 1)} °C."
                     )
 
-        # Conditional antenna sector by aircraft heading
-        if heading_sector.get("available"):
-            ref = heading_sector["reference"]
-            smin = heading_sector["sectorMin"]
-            smax = heading_sector["sectorMax"]
-            ref_dur = heading_sector["referenceDuration"]
-            episodes = heading_sector.get("episodes", [])
+        # Antenna direction inferred from position azimuth + radio signal
+        if antenna_analysis.get("available"):
+            center = antenna_analysis["center"]
+            smin = antenna_analysis["sectorMin"]
+            smax = antenna_analysis["sectorMax"]
+            confidence = antenna_analysis.get("confidence", 0)
+            episodes = antenna_analysis.get("longLossEpisodes", [])
+            probable = [x for x in episodes if x.get("probableSectorExit")]
 
-            if episodes:
-                first = episodes[0]
+            ai_alerts.append(
+                "📡 <b>Розрахунковий напрямок АС:</b> "
+                f"≈ {center:.1f}°. Для кута розкриття {ANTENNA_BEAM_WIDTH_DEG:.0f}° "
+                f"розрахунковий сектор {smin:.1f}°–{smax:.1f}°. "
+                f"Оцінка побудована за LOCAL_POSITION_NED + dBm "
+                f"({antenna_analysis.get('radioSampleCount', 0)} радіозразків; "
+                f"умовна впевненість {confidence}%)."
+            )
+
+            if probable:
+                first = probable[0]
                 first_time = format_timeline_time(first["start"], base_t)
-                max_ep = max(episodes, key=lambda x: x["maxDeviation"])
-                return_text = (
-                    "Heading надалі повертався в умовний сектор."
-                    if heading_sector.get("returnedToSector")
-                    else "До кінця зафіксованого епізоду повернення в сектор не підтверджено."
+                recovery_text = (
+                    "Зв'язок надалі відновився."
+                    if first.get("recovered")
+                    else "До кінця цього епізоду відновлення зв'язку не підтверджено."
                 )
                 ai_alerts.append(
-                    "📡 <b>Ймовірний вихід за умовний сектор АС по Heading:</b> "
-                    f"стабільний базовий Heading {ref:.1f}° утримувався ~{ref_dur:.0f} с; "
-                    f"при розкритті {ANTENNA_BEAM_WIDTH_DEG:.0f}° умовний сектор "
-                    f"{smin:.1f}°–{smax:.1f}°. "
-                    f"Перший підтверджений вихід: {first_time}, Heading {first['firstHeading']:.1f}°, "
-                    f"тривалість {first['duration']:.1f} с. "
-                    f"Максимальне відхилення {max_ep['maxDeviation']:.1f}° "
-                    f"(Heading {max_ep['maxHeading']:.1f}°). {return_text} "
-                    "Це оцінка за курсом БПЛА, а не пряме вимірювання фізичного азимута антенної станції."
+                    "🚨 <b>Ймовірний вихід із зони ефективного покриття АС:</b> "
+                    f"від {first_time} dBm = -128 утримувався {first['duration']:.1f} с. "
+                    f"У {round(first['outsideFraction'] * 100)}% доступних позиційних зразків "
+                    "борт знаходився поза розрахунковим сектором АС; "
+                    f"максимальне відхилення від осі ≈ {first['maxDeviation']:.1f}°. "
+                    f"{recovery_text} Це ймовірнісна оцінка, а не пряме вимірювання положення антени."
+                )
+            elif episodes:
+                longest = max(episodes, key=lambda x: x["duration"])
+                t0 = format_timeline_time(longest["start"], base_t)
+                rec = "зв'язок відновився" if longest.get("recovered") else "відновлення не підтверджено"
+                ai_alerts.append(
+                    "⚠️ <b>Тривала втрата радіоканалу:</b> "
+                    f"-128 dBm від {t0}, тривалість {longest['duration']:.1f} с; {rec}. "
+                    "За геометричним азимутом недостатньо ознак, щоб пов'язати цю подію "
+                    "саме з виходом за сектор АС."
                 )
             else:
                 ai_alerts.append(
-                    "✅ <b>Умовний сектор АС по Heading:</b> "
-                    f"базовий Heading {ref:.1f}° (стабільно ~{ref_dur:.0f} с), "
-                    f"сектор {smin:.1f}°–{smax:.1f}°. "
-                    f"Підтверджених виходів довше {HEADING_OUTSIDE_CONFIRM_SEC:.0f} с не зафіксовано."
+                    f"✅ <b>Тривалої втрати -128 dBm понад {RADIO_LONG_LOSS_SEC:.0f} с "
+                    "у поєднанні з виходом за розрахунковий сектор АС не зафіксовано.</b>"
                 )
         elif ever_armed:
             ai_alerts.append(
-                "ℹ️ <b>Умовний сектор АС по Heading не визначено:</b> "
-                f"не знайдено стабільного Heading тривалістю щонайменше "
-                f"{HEADING_REFERENCE_MIN_DURATION_SEC:.0f} с у межах "
-                f"±{HEADING_REFERENCE_STABLE_TOLERANCE_DEG:.0f}°."
-            )
-
-        # Vibration
-        if vibration_critical_events:
-            is_critical = True
-
-            def _vib_time(ts):
-                elapsed = ts - base_t
-                sign = "-" if elapsed < 0 else ""
-                elapsed = abs(elapsed)
-                minutes = int(elapsed // 60)
-                seconds = elapsed - minutes * 60
-                return f"{sign}{minutes:02d}:{seconds:06.3f}"
-
-            vib_examples = []
-            for item in vibration_critical_events[:5]:
-                vib_examples.append(
-                    f"{_vib_time(item['timestamp'])} "
-                    f"(X={item['x']:.1f}, Y={item['y']:.1f}, Z={item['z']:.1f})"
-                )
-
-            extra_count = len(vibration_critical_events) - len(vib_examples)
-            extra_text = f"; ще епізодів: {extra_count}" if extra_count > 0 else ""
-
-            ai_alerts.append(
-                "🚨 <b>Звернути увагу на критичні вібрації:</b> "
-                f"поріг {VIBRATION_CRITICAL_THRESHOLD:.0f}. "
-                f"Максимум X={max_vib_x:.1f}, Y={max_vib_y:.1f}, Z={max_vib_z:.1f}. "
-                "Час: " + "; ".join(vib_examples) + extra_text + "."
-            )
-        else:
-            ai_alerts.append(
-                "✅ <b>Вібрації:</b> "
-                f"максимум X={max_vib_x:.1f}, Y={max_vib_y:.1f}, Z={max_vib_z:.1f}; "
-                f"критичний поріг {VIBRATION_CRITICAL_THRESHOLD:.0f} не перевищено."
+                "ℹ️ <b>Напрямок АС автоматично не визначено:</b> "
+                "недостатньо одночасних даних LOCAL_POSITION_NED, дальності та коректного dBm. "
+                "Для цієї оцінки NED-origin має знаходитися біля антенної станції."
             )
 
         # Attitude
@@ -2052,16 +2085,17 @@ async def analyze(file: UploadFile = File(...)):
                 "loiterPositionFailCount": loiter_position_fail_count,
                 "externalNavRecoveryCount": external_nav_recovery_count,
                 "smartRtlBadPositionCount": smart_rtl_bad_position_count,
-                "headingSector": {
-                    "available": heading_sector.get("available", False),
-                    "reference": heading_sector.get("reference"),
-                    "sectorMin": heading_sector.get("sectorMin"),
-                    "sectorMax": heading_sector.get("sectorMax"),
-                    "beamWidth": heading_sector.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG),
-                    "referenceDuration": heading_sector.get("referenceDuration", 0.0),
-                    "episodeCount": len(heading_sector.get("episodes", [])),
-                    "maxDeviation": heading_sector.get("maxDeviation", 0.0),
-                    "returnedToSector": heading_sector.get("returnedToSector", False),
+                "antennaAnalysis": {
+                    "available": antenna_analysis.get("available", False),
+                    "center": antenna_analysis.get("center"),
+                    "sectorMin": antenna_analysis.get("sectorMin"),
+                    "sectorMax": antenna_analysis.get("sectorMax"),
+                    "beamWidth": antenna_analysis.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG),
+                    "confidence": antenna_analysis.get("confidence", 0),
+                    "radioSampleCount": antenna_analysis.get("radioSampleCount", 0),
+                    "longLossEpisodeCount": len(antenna_analysis.get("longLossEpisodes", [])),
+                    "probableSectorExitCount": antenna_analysis.get("probableSectorExitCount", 0),
+                    "maxDeviation": antenna_analysis.get("maxDeviation", 0.0),
                 },
                 "alerts": ai_alerts,
             },
