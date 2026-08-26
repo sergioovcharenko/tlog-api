@@ -24,6 +24,18 @@ RADIO_VIDEO_DEGRADED_DBM = -90.0
 RADIO_VIDEO_LOST_DBM = -100.0
 RADIO_LINK_LOST_DBM = -128.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
+ATTITUDE_CRITICAL_THRESHOLD_DEG = 35.0
+
+# RPM / motor diagnostics for this QUAD X numbering:
+# diagonal pairs: Motor 1 <-> Motor 2 and Motor 3 <-> Motor 4.
+RPM_DIAGONAL_PAIRS = ((0, 1), (2, 3))
+RPM_MIN_ACTIVE = 800.0
+RPM_DIAGONAL_WARNING_PCT = 25.0
+RPM_DIAGONAL_CRITICAL_PCT = 35.0
+RPM_DIAGONAL_RECOVERY_PCT = 20.0
+RPM_CRITICAL_PERSIST_SEC = 0.8
+RPM_THRUST_CORRELATION_SEC = 3.0
+MECHANICAL_CORRELATION_SEC = 2.5
 
 # Antenna-station inference from the TLOG.
 # IMPORTANT: this is an estimate, not a direct measurement of antenna azimuth.
@@ -540,6 +552,8 @@ async def analyze(file: UploadFile = File(...)):
         max_speed = 0.0
         max_roll = 0.0
         max_pitch = 0.0
+        max_roll_timestamp = None
+        max_pitch_timestamp = None
         max_dist = 0.0
 
         # Altitude
@@ -573,6 +587,14 @@ async def analyze(file: UploadFile = File(...)):
         curr_amp = 0.0
         curr_rssi_pct = 0
         curr_dbm = 0
+
+        # Attitude (ATTITUDE message)
+        curr_roll = None
+        curr_pitch = None
+        curr_yaw = None
+        attitude_critical_events = []
+        attitude_critical_active = False
+        attitude_critical_peak = None
 
         # VTX
         curr_video_freq = None
@@ -629,6 +651,12 @@ async def analyze(file: UploadFile = File(...)):
         esc_rpm_max = [0, 0, 0, 0]
         esc_current_current = [None, None, None, None]
         esc_current_max = [0.0, 0.0, 0.0, 0.0]
+
+        # RPM diagnostic events.
+        rpm_drop_events = []
+        rpm_pair_candidate = {"1-2": None, "3-4": None}
+        rpm_pair_active = {"1-2": False, "3-4": False}
+        potential_thrust_loss_events = []
 
         # Optical navigation / EKF
         # First false coordinates do not have to be exact zeroes.
@@ -744,6 +772,85 @@ async def analyze(file: UploadFile = File(...)):
                 "threshold": VIBRATION_CRITICAL_THRESHOLD,
             }
 
+        def attitude_snapshot():
+            if curr_roll is None or curr_pitch is None or curr_yaw is None:
+                return None
+
+            # Yaw is displayed for orientation, but is not a tilt angle.
+            # Critical tilt is determined by Roll/Pitch only.
+            is_critical = (
+                abs(curr_roll) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
+                or abs(curr_pitch) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
+            )
+
+            return {
+                "roll": round(curr_roll, 1),
+                "pitch": round(curr_pitch, 1),
+                "yaw": round(curr_yaw % 360.0, 1),
+                "isCritical": is_critical,
+                "threshold": ATTITUDE_CRITICAL_THRESHOLD_DEG,
+            }
+
+        def rpm_analysis_snapshot():
+            """
+            Compare RPM inside the configured diagonal pairs:
+              M1 <-> M2 and M3 <-> M4.
+            """
+            rpms = [
+                float(v) if valid_number(v) else None
+                for v in esc_rpm_current
+            ]
+
+            pairs = []
+            any_warning = False
+            any_critical = False
+
+            for a, b in RPM_DIAGONAL_PAIRS:
+                ra = rpms[a]
+                rb = rpms[b]
+                name = f"{a + 1}-{b + 1}"
+
+                item = {
+                    "pair": name,
+                    "motorA": a + 1,
+                    "motorB": b + 1,
+                    "rpmA": int(round(ra)) if ra is not None else None,
+                    "rpmB": int(round(rb)) if rb is not None else None,
+                    "differencePct": None,
+                    "lowerMotor": None,
+                    "higherMotor": None,
+                    "isWarning": False,
+                    "isCritical": False,
+                }
+
+                if ra is not None and rb is not None:
+                    high = max(ra, rb)
+
+                    if high >= RPM_MIN_ACTIVE and high > 0:
+                        diff = abs(ra - rb) / high * 100.0
+                        lower = a + 1 if ra < rb else b + 1
+                        higher = b + 1 if ra < rb else a + 1
+
+                        item["differencePct"] = round(diff, 1)
+                        item["lowerMotor"] = lower
+                        item["higherMotor"] = higher
+                        item["isWarning"] = diff >= RPM_DIAGONAL_WARNING_PCT
+                        item["isCritical"] = diff >= RPM_DIAGONAL_CRITICAL_PCT
+
+                        any_warning = any_warning or item["isWarning"]
+                        any_critical = any_critical or item["isCritical"]
+
+                pairs.append(item)
+
+            return {
+                "pairs": pairs,
+                "isWarning": any_warning,
+                "isCritical": any_critical,
+                "warningThresholdPct": RPM_DIAGONAL_WARNING_PCT,
+                "criticalThresholdPct": RPM_DIAGONAL_CRITICAL_PCT,
+                "pairsText": "M1↔M2, M3↔M4",
+            }
+
         def add_event(
             text,
             t_stamp,
@@ -782,6 +889,8 @@ async def analyze(file: UploadFile = File(...)):
                         for i in range(4)
                     ],
                     "vibration": vibration_snapshot(),
+                    "attitude": attitude_snapshot(),
+                    "rpmAnalysis": rpm_analysis_snapshot(),
                     "system_text": "" if is_pilot_action else text,
                     "pilot_text": text if is_pilot_action else "",
                     "eventType": event_type,
@@ -821,6 +930,8 @@ async def analyze(file: UploadFile = File(...)):
                         for i in range(4)
                     ],
                     "vibration": vibration_snapshot(),
+                    "attitude": attitude_snapshot(),
+                    "rpmAnalysis": rpm_analysis_snapshot(),
                     "system_text": "",
                     "pilot_text": "",
                     "eventType": "SNAPSHOT",
@@ -883,6 +994,7 @@ async def analyze(file: UploadFile = File(...)):
             nonlocal ekf_variance_count, ekf_stopped_aiding_count
             nonlocal loiter_position_fail_count, external_nav_recovery_count
             nonlocal smart_rtl_bad_position_count, prearm_position_count
+            nonlocal potential_thrust_loss_events
 
             txt_lower = full_txt.lower()
 
@@ -907,6 +1019,31 @@ async def analyze(file: UploadFile = File(...)):
             if "prearm: need position estimate" in txt_lower:
                 prearm_position_count += 1
 
+            # Potential Thrust Loss is a warning candidate, not automatic proof
+            # of motor failure. Correlate it later with RPM / ATT / VIB.
+            thrust_match = re.search(
+                r"potential\s+thrust\s+loss\s*\(?\s*(\d+)\s*\)?",
+                full_txt,
+                flags=re.IGNORECASE,
+            )
+            thrust_motor = None
+            if thrust_match:
+                try:
+                    thrust_motor = int(thrust_match.group(1))
+                except (TypeError, ValueError):
+                    thrust_motor = None
+
+                potential_thrust_loss_events.append({
+                    "timestamp": timestamp,
+                    "mode": mode,
+                    "motor": thrust_motor,
+                    "text": full_txt,
+                    "rpm": [
+                        int(round(v)) if valid_number(v) else None
+                        for v in esc_rpm_current
+                    ],
+                })
+
             # Save every original "initial pos NED" found in the TLOG.
             ned_coords = parse_initial_pos_ned(full_txt)
 
@@ -923,13 +1060,15 @@ async def analyze(file: UploadFile = File(...)):
             is_err = severity <= 4
 
             # Keep original ArduPilot STATUSTEXT in timeline.
+            # Potential Thrust Loss gets its own red/clickable event type.
+            event_type = "POTENTIAL_THRUST_LOSS" if thrust_match else "SYSTEM"
             add_event(
                 full_txt,
                 timestamp,
                 mode,
-                is_err,
+                bool(is_err or thrust_match),
                 False,
-                "SYSTEM",
+                event_type,
             )
 
         # ====================================================
@@ -1311,16 +1450,62 @@ async def analyze(file: UploadFile = File(...)):
             # ATTITUDE
             elif msg_type == "ATTITUDE":
                 if valid_number(msg.roll):
-                    max_roll = max(
-                        max_roll,
-                        abs(math.degrees(msg.roll)),
-                    )
+                    curr_roll = math.degrees(msg.roll)
+                    abs_roll = abs(curr_roll)
+                    if abs_roll > max_roll:
+                        max_roll = abs_roll
+                        max_roll_timestamp = current_timestamp
 
                 if valid_number(msg.pitch):
-                    max_pitch = max(
-                        max_pitch,
-                        abs(math.degrees(msg.pitch)),
+                    curr_pitch = math.degrees(msg.pitch)
+                    abs_pitch = abs(curr_pitch)
+                    if abs_pitch > max_pitch:
+                        max_pitch = abs_pitch
+                        max_pitch_timestamp = current_timestamp
+
+                if valid_number(msg.yaw):
+                    curr_yaw = math.degrees(msg.yaw) % 360.0
+
+                # Critical tilt episode. Roll/Pitch >= 35 deg on ANY tilt axis.
+                # Yaw is shown in the dropdown but does not trigger tilt criticality.
+                if curr_roll is not None and curr_pitch is not None:
+                    crit = (
+                        abs(curr_roll) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
+                        or abs(curr_pitch) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
                     )
+                    peak = max(abs(curr_roll), abs(curr_pitch))
+
+                    if crit:
+                        if (not attitude_critical_active) or attitude_critical_peak is None:
+                            attitude_critical_active = True
+                            attitude_critical_peak = {
+                                "timestamp": current_timestamp,
+                                "roll": curr_roll,
+                                "pitch": curr_pitch,
+                                "yaw": curr_yaw,
+                                "peak": peak,
+                            }
+                            # Add one exact timeline row at the start of each episode.
+                            add_event(
+                                f"Критичний кут нахилу: Roll {curr_roll:.1f}°, Pitch {curr_pitch:.1f}°",
+                                current_timestamp,
+                                current_mode,
+                                is_error=True,
+                                event_type="ATTITUDE_CRITICAL",
+                            )
+                        elif peak > attitude_critical_peak["peak"]:
+                            attitude_critical_peak.update({
+                                "timestamp": current_timestamp,
+                                "roll": curr_roll,
+                                "pitch": curr_pitch,
+                                "yaw": curr_yaw,
+                                "peak": peak,
+                            })
+                    elif attitude_critical_active:
+                        if attitude_critical_peak is not None:
+                            attitude_critical_events.append(dict(attitude_critical_peak))
+                        attitude_critical_active = False
+                        attitude_critical_peak = None
 
             # GLOBAL POSITION
             elif msg_type == "GLOBAL_POSITION_INT":
@@ -1501,6 +1686,85 @@ async def analyze(file: UploadFile = File(...)):
                                 esc_current_current[i] = amps
                                 if amps > esc_current_max[i]:
                                     esc_current_max[i] = amps
+
+                # Detect sustained RPM asymmetry inside the real diagonal pairs:
+                # M1<->M2 and M3<->M4.
+                if is_currently_armed:
+                    rpm_diag = rpm_analysis_snapshot()
+
+                    for pair in rpm_diag.get("pairs", []):
+                        pair_name = pair["pair"]
+                        diff = pair.get("differencePct")
+                        critical_now = bool(pair.get("isCritical"))
+
+                        if critical_now and diff is not None:
+                            candidate = rpm_pair_candidate.get(pair_name)
+
+                            if candidate is None:
+                                candidate = {
+                                    "start": current_timestamp,
+                                    "peakTimestamp": current_timestamp,
+                                    "peakDifferencePct": diff,
+                                    "lowerMotor": pair.get("lowerMotor"),
+                                    "higherMotor": pair.get("higherMotor"),
+                                    "rpmA": pair.get("rpmA"),
+                                    "rpmB": pair.get("rpmB"),
+                                }
+                                rpm_pair_candidate[pair_name] = candidate
+                            elif diff > candidate.get("peakDifferencePct", 0):
+                                candidate.update({
+                                    "peakTimestamp": current_timestamp,
+                                    "peakDifferencePct": diff,
+                                    "lowerMotor": pair.get("lowerMotor"),
+                                    "higherMotor": pair.get("higherMotor"),
+                                    "rpmA": pair.get("rpmA"),
+                                    "rpmB": pair.get("rpmB"),
+                                })
+
+                            duration = current_timestamp - candidate["start"]
+
+                            if (
+                                duration >= RPM_CRITICAL_PERSIST_SEC
+                                and not rpm_pair_active.get(pair_name, False)
+                            ):
+                                rpm_pair_active[pair_name] = True
+
+                                event = {
+                                    "timestamp": current_timestamp,
+                                    "startTimestamp": candidate["start"],
+                                    "mode": current_mode,
+                                    "pair": pair_name,
+                                    "differencePct": float(candidate["peakDifferencePct"]),
+                                    "lowerMotor": candidate.get("lowerMotor"),
+                                    "higherMotor": candidate.get("higherMotor"),
+                                    "rpmA": candidate.get("rpmA"),
+                                    "rpmB": candidate.get("rpmB"),
+                                    "rpms": [
+                                        int(round(v)) if valid_number(v) else None
+                                        for v in esc_rpm_current
+                                    ],
+                                }
+                                rpm_drop_events.append(event)
+
+                                low_motor = event.get("lowerMotor")
+                                add_event(
+                                    f"🚨 Аномальна різниця RPM у діагоналі M{pair_name}: "
+                                    f"{event['differencePct']:.1f}%"
+                                    + (
+                                        f"; нижчий RPM у Motor {low_motor}"
+                                        if low_motor else ""
+                                    ),
+                                    current_timestamp,
+                                    current_mode,
+                                    True,
+                                    False,
+                                    "RPM_DIAGONAL_CRITICAL",
+                                )
+
+                        else:
+                            if diff is None or diff < RPM_DIAGONAL_RECOVERY_PCT:
+                                rpm_pair_candidate[pair_name] = None
+                                rpm_pair_active[pair_name] = False
 
             # STATUSTEXT with MAVLink2 chunk reassembly
             elif msg_type == "STATUSTEXT":
@@ -1719,6 +1983,12 @@ async def analyze(file: UploadFile = File(...)):
 
         mins, secs = divmod(duration_sec, 60)
 
+        # Close an attitude episode that is still active at EOF.
+        if attitude_critical_active and attitude_critical_peak is not None:
+            attitude_critical_events.append(dict(attitude_critical_peak))
+            attitude_critical_active = False
+            attitude_critical_peak = None
+
         # Estimate antenna pointing from NED position azimuth + dBm.
         antenna_analysis = analyze_antenna_direction(raw_timeline, arm_timestamp)
 
@@ -1760,6 +2030,8 @@ async def analyze(file: UploadFile = File(...)):
                     "temp": ev["temp"],
                     "esc": ev["esc"],
                     "vibration": ev.get("vibration"),
+                    "attitude": ev.get("attitude"),
+                    "rpmAnalysis": ev.get("rpmAnalysis"),
                     "systemText": ev["system_text"],
                     "pilotText": ev["pilot_text"],
                     "eventType": ev["eventType"],
@@ -2113,11 +2385,176 @@ async def analyze(file: UploadFile = File(...)):
                 "недостатньо даних і для LOCAL_POSITION_NED + dBm, і для резервної оцінки Heading + dBm."
             )
 
-        # Attitude
-        if max_roll > 80 or max_pitch > 80:
+        # RPM / thrust diagnostics.
+        if rpm_drop_events:
+            strongest_rpm = max(
+                rpm_drop_events,
+                key=lambda x: x.get("differencePct", 0.0),
+            )
+            rpm_time = format_timeline_time(strongest_rpm["timestamp"], base_t)
+            pair = strongest_rpm.get("pair", "?")
+            low_motor = strongest_rpm.get("lowerMotor")
+            rpms = strongest_rpm.get("rpms", [None, None, None, None])
+            rpm_values_text = ", ".join(
+                f"M{i + 1}={v if v is not None else '—'}"
+                for i, v in enumerate(rpms)
+            )
+
             ai_alerts.append(
-                "🔄 <b>Великий кут нахилу:</b> "
-                f"{round(max(max_roll, max_pitch), 1)}°."
+                f'<span class="ai-jump" data-jump-time="{rpm_time}">'
+                "🚨 <b>Аномальна асиметрія RPM двигунів:</b> "
+                f"о {rpm_time} у діагоналі M{pair} різниця досягла "
+                f"{strongest_rpm.get('differencePct', 0.0):.1f}%. "
+                + (
+                    f"Нижчий RPM зафіксовано у Motor {low_motor}. "
+                    if low_motor else ""
+                )
+                + f"RPM у цей момент: {rpm_values_text}. "
+                f"Критичний поріг діагональної різниці: ≥ {RPM_DIAGONAL_CRITICAL_PCT:.0f}% "
+                f"протягом ≥ {RPM_CRITICAL_PERSIST_SEC:.1f} с. "
+                "Натисніть, щоб перейти до рядка Timeline."
+                "</span>"
+            )
+            is_critical = True
+
+        # Potential Thrust Loss is correlated with RPM, but is not sufficient alone.
+        for thrust in potential_thrust_loss_events:
+            thrust_time = format_timeline_time(thrust["timestamp"], base_t)
+            motor = thrust.get("motor")
+
+            nearby_rpm = [
+                e for e in rpm_drop_events
+                if abs(e["timestamp"] - thrust["timestamp"]) <= RPM_THRUST_CORRELATION_SEC
+            ]
+            matching_rpm = [
+                e for e in nearby_rpm
+                if motor is not None and e.get("lowerMotor") == motor
+            ]
+
+            if matching_rpm:
+                e = max(matching_rpm, key=lambda x: x.get("differencePct", 0.0))
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
+                    f"🚨 <b>Potential Thrust Loss ({motor}) підтверджено телеметрією RPM:</b> "
+                    f"поруч із повідомленням зафіксовано діагональну різницю "
+                    f"{e.get('differencePct', 0.0):.1f}% з нижчим RPM у Motor {motor}. "
+                    "Це підсилює ймовірність реальної втрати тяги/проблеми двигуна, ESC "
+                    "або механічного пошкодження пропелера. "
+                    "Натисніть, щоб перейти до рядка Timeline."
+                    "</span>"
+                )
+                is_critical = True
+            elif nearby_rpm:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
+                    f"⚠️ <b>Potential Thrust Loss ({motor if motor is not None else '?'}) :</b> "
+                    "повідомлення зафіксовано, однак найбільша RPM-асиметрія поруч "
+                    "припала на інший двигун/діагональ. Потрібна ручна перевірка. "
+                    "Саме повідомлення не вважається доказом відмови."
+                    "</span>"
+                )
+            else:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
+                    f"⚠️ <b>Potential Thrust Loss ({motor if motor is not None else '?'}) без RPM-підтвердження:</b> "
+                    "у часовому вікні ±3 с критичної діагональної різниці RPM не виявлено. "
+                    "Подія класифікується як попередження, а не підтверджена відмова. "
+                    "Натисніть, щоб перейти до рядка Timeline."
+                    "</span>"
+                )
+
+        # Multi-sensor scenario for possible external mechanical influence.
+        impact_candidates = []
+        for rpm_event in rpm_drop_events:
+            t0 = rpm_event["timestamp"]
+            near_att = [
+                x for x in attitude_critical_events
+                if abs(x.get("timestamp", -1e9) - t0) <= MECHANICAL_CORRELATION_SEC
+            ]
+            near_vib = [
+                x for x in vibration_critical_events
+                if abs(x.get("timestamp", -1e9) - t0) <= MECHANICAL_CORRELATION_SEC
+            ]
+            near_thrust = [
+                x for x in potential_thrust_loss_events
+                if abs(x.get("timestamp", -1e9) - t0) <= RPM_THRUST_CORRELATION_SEC
+            ]
+
+            score = int(bool(near_att)) + int(bool(near_vib)) + int(bool(near_thrust))
+            if score >= 1:
+                impact_candidates.append({
+                    "rpm": rpm_event,
+                    "att": near_att,
+                    "vib": near_vib,
+                    "thrust": near_thrust,
+                    "score": score,
+                })
+
+        if impact_candidates:
+            impact = max(
+                impact_candidates,
+                key=lambda x: (
+                    x["score"],
+                    x["rpm"].get("differencePct", 0.0),
+                ),
+            )
+            event = impact["rpm"]
+            impact_time = format_timeline_time(event["timestamp"], base_t)
+
+            features = [
+                f"асиметрія RPM {event.get('differencePct', 0.0):.1f}% "
+                f"у діагоналі M{event.get('pair', '?')}"
+            ]
+            if impact["att"]:
+                att = max(impact["att"], key=lambda x: x.get("peak", 0.0))
+                features.append(
+                    f"різка зміна просторового положення до "
+                    f"{att.get('peak', 0.0):.1f}° по Roll/Pitch"
+                )
+            if impact["vib"]:
+                vib = max(impact["vib"], key=lambda x: x.get("peak", 0.0))
+                features.append(
+                    f"вібрації до {vib.get('peak', 0.0):.1f}"
+                )
+            if impact["thrust"]:
+                motors = sorted({
+                    x.get("motor") for x in impact["thrust"]
+                    if x.get("motor") is not None
+                })
+                features.append(
+                    "Potential Thrust Loss"
+                    + (f" для Motor {','.join(map(str, motors))}" if motors else "")
+                )
+
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{impact_time}">'
+                "🧩 <b>Ознаки ймовірного зовнішнього механічного впливу "
+                "або пошкодження силової установки:</b> "
+                + "; ".join(features)
+                + ". Одночасна/близька в часі поява цих незалежних ознак "
+                "нехарактерна для простої плавної зміни тяги. Така картина може "
+                "відповідати контакту або удару стороннього об'єкта, потраплянню "
+                "стороннього предмета в площину гвинтів, пошкодженню пропелера, "
+                "двигуна чи ESC. За одним TLOG неможливо встановити конкретний "
+                "предмет, його походження або підтвердити навмисне ураження. "
+                "Натисніть, щоб перейти до найближчого критичного рядка Timeline."
+                "</span>"
+            )
+            is_critical = True
+
+        # Attitude / tilt. Threshold requested for timeline highlighting: >= 35 deg.
+        if attitude_critical_events:
+            peak_event = max(attitude_critical_events, key=lambda x: x.get("peak", 0.0))
+            peak_time = format_timeline_time(peak_event.get("timestamp"), base_t)
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{peak_time}">'
+                "🔄 <b>Критичний кут нахилу БПЛА:</b> "
+                f"о {peak_time} Roll {peak_event.get('roll', 0.0):.1f}°, "
+                f"Pitch {peak_event.get('pitch', 0.0):.1f}°, "
+                f"Yaw {(peak_event.get('yaw') or 0.0):.1f}°. "
+                f"Поріг підсвічування Roll/Pitch: ≥ {ATTITUDE_CRITICAL_THRESHOLD_DEG:.0f}°. "
+                "Натисніть, щоб перейти до рядка Timeline."
+                "</span>"
             )
             is_critical = True
 
@@ -2218,6 +2655,12 @@ async def analyze(file: UploadFile = File(...)):
                 "maxSpeed": round(max_speed, 1),
                 "maxRoll": round(max_roll, 1),
                 "maxPitch": round(max_pitch, 1),
+                "attitudeCriticalThreshold": ATTITUDE_CRITICAL_THRESHOLD_DEG,
+                "attitudeCriticalEventCount": len(attitude_critical_events),
+                "rpmDiagonalCriticalThresholdPct": RPM_DIAGONAL_CRITICAL_PCT,
+                "rpmDiagonalWarningThresholdPct": RPM_DIAGONAL_WARNING_PCT,
+                "rpmDropEventCount": len(rpm_drop_events),
+                "potentialThrustLossCount": len(potential_thrust_loss_events),
                 "modes": modes_str,
                 "msgCount": message_count,
                 "altitudeSource": altitude_source,
