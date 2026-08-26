@@ -241,6 +241,7 @@ async def analyze(file: UploadFile = File(...)):
 
         # Current state
         curr_dist = 0.0
+        curr_azimuth = None
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -430,6 +431,7 @@ async def analyze(file: UploadFile = File(...)):
                     "mode": mode,
                     "alt": f"{round(curr_alt, 1)} м",
                     "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
+                    "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -466,6 +468,7 @@ async def analyze(file: UploadFile = File(...)):
                     "mode": current_mode,
                     "alt": f"{round(curr_alt, 1)} м",
                     "dist": f"{round(curr_dist, 1)} м" if curr_dist > 0 else "0.0 м",
+                    "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -762,6 +765,14 @@ async def analyze(file: UploadFile = File(...)):
             elif msg_type == "VFR_HUD":
                 latest_baro_alt = float(msg.alt)
 
+                # Азимут/курс БПЛА безпосередньо з MAVLink VFR_HUD.heading.
+                # У Timeline показуємо тільки числове значення в градусах.
+                heading_val = getattr(msg, "heading", None)
+                if valid_number(heading_val):
+                    heading_val = float(heading_val)
+                    if 0.0 <= heading_val <= 360.0:
+                        curr_azimuth = heading_val % 360.0
+
                 if ground_baro_alt is None:
                     ground_baro_alt = latest_baro_alt
 
@@ -829,6 +840,7 @@ async def analyze(file: UploadFile = File(...)):
                             max_dist,
                             curr_dist,
                         )
+
 
                     ned_alt = -z
 
@@ -1396,6 +1408,7 @@ async def analyze(file: UploadFile = File(...)):
                     "mode": ev["mode"],
                     "alt": ev["alt"],
                     "dist": ev["dist"],
+                    "azimuth": ev.get("azimuth"),
                     "vtxBand": ev["vtxBand"],
                     "vtxChannel": ev["vtxChannel"],
                     "videoFreq": ev["videoFreq"],
