@@ -512,29 +512,29 @@ def analyze_flight_sessions(raw_timeline, log_end_timestamp=None):
     markers=[]
     for s in sessions:
         r=clone_near(s["armTimestamp"])
-        r.update(timestamp=s["armTimestamp"],system_text=f"🟢 ПОЛІТ №{s['number']} — ПОЧАТОК СЕСІЇ / ARM",
+        r.update(timestamp=s["armTimestamp"],system_text="",analysis_text=f"🟢 ПОЛІТ №{s['number']} — ПОЧАТОК СЕСІЇ / ARM",
                  eventType="FLIGHT_SESSION_START",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=None)
         markers.append(r)
         for ep in s["takeoffEpisodes"]:
             r=clone_near(ep["startTimestamp"])
             r.update(timestamp=ep["startTimestamp"],
-                     system_text=f"↗ {'ПОВТОРНИЙ ЗЛІТ' if ep['number']>1 else 'ЗЛІТ'} — політ №{s['number']}, епізод {ep['number']}",
+                     system_text="",analysis_text=f"↗ {'ПОВТОРНИЙ ЗЛІТ' if ep['number']>1 else 'ЗЛІТ'} — політ №{s['number']}, епізод {ep['number']}",
                      eventType="FLIGHT_TAKEOFF",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=ep["number"])
             markers.append(r)
             if ep.get("endTimestamp") is not None and ep.get("endReason")=="landed":
                 r=clone_near(ep["endTimestamp"])
                 r.update(timestamp=ep["endTimestamp"],
-                         system_text=f"↘ ПОСАДКА — політ №{s['number']}, епізод {ep['number']} завершено БЕЗ DISARM",
+                         system_text="",analysis_text=f"↘ ПОСАДКА — політ №{s['number']}, епізод {ep['number']} завершено БЕЗ DISARM",
                          eventType="FLIGHT_LANDING",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=ep["number"])
                 markers.append(r)
         if s.get("disarmTimestamp") is not None:
             r=clone_near(s["disarmTimestamp"])
-            r.update(timestamp=s["disarmTimestamp"],system_text=f"🔵 ПОЛІТ №{s['number']} — ЗАВЕРШЕННЯ СЕСІЇ / DISARM",
+            r.update(timestamp=s["disarmTimestamp"],system_text="",analysis_text=f"🔵 ПОЛІТ №{s['number']} — ЗАВЕРШЕННЯ СЕСІЇ / DISARM",
                      eventType="FLIGHT_SESSION_END",is_error=False,flightNumber=s["number"],takeoffEpisodeNumber=None)
             markers.append(r)
         elif s.get("endedArmed"):
             r=clone_near(s["endTimestamp"])
-            r.update(timestamp=s["endTimestamp"],system_text=f"🚨 ПОЛІТ №{s['number']} — TLOG ЗАВЕРШИВСЯ ПРИ ARMED",
+            r.update(timestamp=s["endTimestamp"],system_text="",analysis_text=f"🚨 ПОЛІТ №{s['number']} — TLOG ЗАВЕРШИВСЯ ПРИ ARMED",
                      eventType="FLIGHT_SESSION_OPEN_AT_END",is_error=True,flightNumber=s["number"],takeoffEpisodeNumber=None)
             markers.append(r)
 
@@ -1023,6 +1023,21 @@ async def analyze(file: UploadFile = File(...)):
                 "pairsText": "M1↔M2, M3↔M4",
             }
 
+        def is_serious_system_text(text):
+            t = str(text or "").lower()
+            serious_patterns = (
+                "potential thrust loss",
+                "crash:",
+                "crash ",
+                "failsafe",
+                "ekf variance",
+                "ekf3 imu0 stopped aiding",
+                "smart rtl failed",
+                "smart rtl deactivated",
+                "motor emergency",
+            )
+            return any(p in t for p in serious_patterns)
+
         def add_event(
             text,
             t_stamp,
@@ -1107,6 +1122,7 @@ async def analyze(file: UploadFile = File(...)):
                     "rpmAnalysis": rpm_analysis_snapshot(),
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "system_text": "",
+                    "analysis_text": "",
                     "pilot_text": "",
                     "eventType": "SNAPSHOT",
                     "isError": False,
@@ -1240,7 +1256,7 @@ async def analyze(file: UploadFile = File(...)):
                 full_txt,
                 timestamp,
                 mode,
-                bool(is_err or thrust_match),
+                bool(thrust_match or is_serious_system_text(full_txt)),
                 False,
                 event_type,
             )
@@ -1909,7 +1925,11 @@ async def analyze(file: UploadFile = File(...)):
 
                 # Detect sustained RPM asymmetry inside the real diagonal pairs:
                 # M1<->M2 and M3<->M4.
-                if is_currently_armed:
+                if (
+                    is_currently_armed
+                    and valid_number(curr_alt)
+                    and float(curr_alt) >= FLIGHT_TAKEOFF_ALT_M
+                ):
                     rpm_diag = rpm_analysis_snapshot()
 
                     for pair in rpm_diag.get("pairs", []):
