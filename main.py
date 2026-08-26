@@ -18,6 +18,11 @@ MAX_CLIMB_RATE = 50.0
 GROUND_ALTITUDE = 0.5
 RADIO_DROPOUT_CRITICAL_SEC = 2.0
 RADIO_LONG_LOSS_SEC = 60.0
+# Робочі пороги радіолінії, задані користувачем.
+RADIO_NORMAL_DBM = -85.0
+RADIO_VIDEO_DEGRADED_DBM = -90.0
+RADIO_VIDEO_LOST_DBM = -100.0
+RADIO_LINK_LOST_DBM = -128.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
 
 # Antenna-station inference from the TLOG.
@@ -81,22 +86,60 @@ def format_timeline_time(timestamp, base_t):
     return f"{sign}{minutes:02d}:{seconds:06.3f}"
 
 
+def radio_state_from_dbm(dbm):
+    """Класифікація радіолінії за робочими порогами аналізатора."""
+    if not valid_number(dbm):
+        return "UNKNOWN"
+    v = float(dbm)
+    if v <= RADIO_LINK_LOST_DBM:
+        return "LINK_LOST"
+    if v <= RADIO_VIDEO_LOST_DBM:
+        # Діапазон -101…-127 користувач окремо не задавав.
+        # Вважаємо його дуже слабкою телеметрією, але не повною втратою до -128.
+        return "VERY_WEAK_TELEMETRY"
+    if v <= RADIO_VIDEO_DEGRADED_DBM:
+        return "VIDEO_LOST_TELEMETRY_OK"
+    if v < RADIO_NORMAL_DBM:
+        return "VIDEO_DEGRADED"
+    return "NORMAL"
+
+
+def radio_state_text(state):
+    return {
+        "NORMAL": "Норма: відео та телеметрія стабільні",
+        "VIDEO_DEGRADED": "Підсипання / деградація відео",
+        "VIDEO_LOST_TELEMETRY_OK": "Втрата відео, телеметрія присутня",
+        "VERY_WEAK_TELEMETRY": "Дуже слабка телеметрія",
+        "LINK_LOST": "Відсутні відео та телеметрія",
+        "UNKNOWN": "Немає даних",
+    }.get(state, "Немає даних")
+
+
+def circular_weighted_mean(samples):
+    """samples = [(angle_deg, weight), ...]"""
+    if not samples:
+        return None, 0.0
+    sin_sum = sum(w * math.sin(math.radians(a)) for a, w in samples)
+    cos_sum = sum(w * math.cos(math.radians(a)) for a, w in samples)
+    wsum = sum(w for _, w in samples) or 1.0
+    angle = math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
+    resultant = math.sqrt(sin_sum*sin_sum + cos_sum*cos_sum) / wsum
+    return angle, max(0.0, min(1.0, resultant))
+
+
 def analyze_antenna_direction(raw_timeline, arm_timestamp):
     """
-    Estimate the antenna-station pointing direction from:
-      * geometric azimuth of the aircraft from LOCAL_POSITION_NED;
-      * RADIO/RADIO_STATUS dBm;
-      * distance from NED origin.
+    Оцінка напрямку АС та втрати зв'язку.
 
-    Distance is approximately compensated with +20*log10(distance) so close
-    samples do not automatically look better only because the aircraft is near.
+    PRIMARY: позиційний азимут БПЛА з LOCAL_POSITION_NED + dBm + дальність.
+    FALLBACK: Heading БПЛА + dBm, якщо геометричного NED-азимута недостатньо.
 
-    A probable sector-exit event is reported only when a continuous -128 dBm
-    period lasts >= RADIO_LONG_LOSS_SEC and the aircraft position azimuth is
-    outside the inferred +/-15 degree sector for most of that period.
+    Важливо: fallback по Heading є лише евристикою, тому що Heading показує
+    напрямок носа БПЛА, а не геометричний напрямок від АС до БПЛА.
     """
     result = {
         "available": False,
+        "method": None,
         "center": None,
         "sectorMin": None,
         "sectorMax": None,
@@ -108,6 +151,8 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         "probableSectorExitCount": 0,
         "firstProbableExitTimestamp": None,
         "maxDeviation": 0.0,
+        "probableBoardLoss": False,
+        "probableBoardLossDueSector": False,
     }
 
     if arm_timestamp is None:
@@ -118,61 +163,90 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         if ev.get("eventType") != "SNAPSHOT":
             continue
         ts = ev.get("timestamp")
-        pos_az = ev.get("positionAzimuth")
-        dist = ev.get("distValue")
-        dbm = ev.get("dbm")
         if ts is None or float(ts) < arm_timestamp:
             continue
+        pos_az = ev.get("positionAzimuth")
+        heading = ev.get("azimuth")
+        dist = ev.get("distValue")
+        dbm = ev.get("dbm")
         snapshots.append({
             "timestamp": float(ts),
             "positionAzimuth": float(pos_az) % 360.0 if valid_number(pos_az) else None,
+            "heading": float(heading) % 360.0 if valid_number(heading) else None,
             "distance": float(dist) if valid_number(dist) else None,
             "dbm": float(dbm) if valid_number(dbm) else None,
         })
 
-    # 1) Estimate antenna center from valid (non -128) radio samples.
-    scored = []
-    for s in snapshots:
-        az = s["positionAzimuth"]
-        dist = s["distance"]
-        dbm = s["dbm"]
-        if az is None or dist is None or dbm is None:
+    # --------------------------------------------------------
+    # 1) PRIMARY: оцінюємо вісь АС за NED-позицією + добрим сигналом.
+    # Для визначення осі використовуємо в першу чергу NORMAL (>= -85 dBm).
+    # Якщо таких мало, допускаємо всі не-втрачені зразки > -128 dBm.
+    # --------------------------------------------------------
+    good_position = []
+    fallback_position = []
+    for x in snapshots:
+        az, dist, dbm = x["positionAzimuth"], x["distance"], x["dbm"]
+        if az is None or dist is None or dbm is None or dist < ANTENNA_MIN_DISTANCE_M:
             continue
-        if dist < ANTENNA_MIN_DISTANCE_M or dbm <= -128 or dbm >= 0:
+        if dbm <= RADIO_LINK_LOST_DBM or dbm >= 0:
             continue
         corrected = dbm + 20.0 * math.log10(max(dist, 1.0))
-        scored.append((corrected, az, dbm, dist, s["timestamp"]))
+        fallback_position.append((corrected, az, dbm, dist, x["timestamp"]))
+        if dbm >= RADIO_NORMAL_DBM:
+            good_position.append((corrected, az, dbm, dist, x["timestamp"]))
 
+    scored = good_position if len(good_position) >= ANTENNA_MIN_RADIO_SAMPLES else fallback_position
     result["radioSampleCount"] = len(scored)
 
     reference = None
+    compare_key = "positionAzimuth"
+
     if len(scored) >= ANTENNA_MIN_RADIO_SAMPLES:
         scored.sort(key=lambda x: x[0], reverse=True)
-        top_n = max(
-            ANTENNA_MIN_RADIO_SAMPLES,
-            int(math.ceil(len(scored) * ANTENNA_TOP_SIGNAL_FRACTION)),
-        )
+        top_n = max(ANTENNA_MIN_RADIO_SAMPLES, int(math.ceil(len(scored) * ANTENNA_TOP_SIGNAL_FRACTION)))
         top = scored[:min(top_n, len(scored))]
-
         min_score = min(x[0] for x in top)
-        weights = [(x[0] - min_score) + 1.0 for x in top]
-        sin_sum = sum(w * math.sin(math.radians(x[1])) for w, x in zip(weights, top))
-        cos_sum = sum(w * math.cos(math.radians(x[1])) for w, x in zip(weights, top))
-        reference = math.degrees(math.atan2(sin_sum, cos_sum)) % 360.0
-
-        wsum = sum(weights) or 1.0
-        resultant = math.sqrt(sin_sum * sin_sum + cos_sum * cos_sum) / wsum
-        # Confidence is intentionally conservative: angular concentration + data volume.
+        weighted = [(x[1], (x[0] - min_score) + 1.0) for x in top]
+        reference, concentration = circular_weighted_mean(weighted)
         sample_factor = min(1.0, len(scored) / 60.0)
-        confidence = int(round(max(0.0, min(1.0, resultant * sample_factor)) * 100.0))
+        confidence = int(round(concentration * sample_factor * 100.0))
+        result["method"] = "POSITION_NED"
+        result["confidence"] = confidence
 
+    # --------------------------------------------------------
+    # 1b) FALLBACK: якщо NED не вистачає — оцінка за Heading + нормальним dBm.
+    # Це спеціально позначається як евристика з обмеженою впевненістю.
+    # --------------------------------------------------------
+    if reference is None:
+        heading_samples = []
+        for x in snapshots:
+            h, dbm = x["heading"], x["dbm"]
+            if h is None or dbm is None or dbm < RADIO_NORMAL_DBM or dbm >= 0:
+                continue
+            # Кращий dBm має більшу вагу, але без надмірного домінування.
+            w = max(1.0, min(25.0, dbm - RADIO_NORMAL_DBM + 1.0))
+            heading_samples.append((h, w))
+        if len(heading_samples) >= ANTENNA_MIN_RADIO_SAMPLES:
+            reference, concentration = circular_weighted_mean(heading_samples)
+            sample_factor = min(1.0, len(heading_samples) / 60.0)
+            # Heading-fallback навмисно обмежуємо 65%.
+            confidence = int(round(min(0.65, concentration * sample_factor * 0.65) * 100.0))
+            result["method"] = "HEADING_FALLBACK"
+            result["confidence"] = confidence
+            result["radioSampleCount"] = len(heading_samples)
+            compare_key = "heading"
+
+    if reference is not None:
         result["available"] = True
         result["center"] = round(reference, 1)
         result["sectorMin"] = round((reference - ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
         result["sectorMax"] = round((reference + ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
-        result["confidence"] = confidence
 
-    # 2) Find continuous -128 dBm episodes lasting >= 60 s.
+    # --------------------------------------------------------
+    # 2) Безперервні епізоди -128 dBm >= 60 с.
+    # Якщо після епізоду з'явився dBm > -128 — зв'язок відновився.
+    # Якщо епізод доходить до EOF — recovered=False.
+    # --------------------------------------------------------
     long_episodes = []
     active = None
 
@@ -183,29 +257,21 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         if duration < RADIO_LONG_LOSS_SEC:
             return
 
-        pos_samples = ep["positionSamples"]
+        angle_samples = ep["angleSamples"]
         outside_samples = 0
         max_dev = 0.0
-        first_az = None
+        first_angle = None
         if reference is not None:
-            for _, az in pos_samples:
-                dev = heading_difference_deg(az, reference) or 0.0
-                if first_az is None:
-                    first_az = az
+            for _, angle in angle_samples:
+                dev = heading_difference_deg(angle, reference) or 0.0
+                if first_angle is None:
+                    first_angle = angle
                 if dev > ANTENNA_HALF_ANGLE_DEG:
                     outside_samples += 1
                 max_dev = max(max_dev, dev)
 
-        outside_fraction = (
-            outside_samples / len(pos_samples)
-            if pos_samples and reference is not None
-            else 0.0
-        )
-        probable_exit = (
-            reference is not None
-            and len(pos_samples) >= 10
-            and outside_fraction >= 0.60
-        )
+        outside_fraction = outside_samples / len(angle_samples) if angle_samples and reference is not None else 0.0
+        probable_exit = reference is not None and len(angle_samples) >= 10 and outside_fraction >= 0.60
 
         long_episodes.append({
             "start": ep["start"],
@@ -213,34 +279,27 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
             "duration": round(duration, 1),
             "recovered": bool(recovered),
             "recoveryTimestamp": recovery_ts,
-            "firstPositionAzimuth": round(first_az, 1) if first_az is not None else None,
+            "firstAngle": round(first_angle, 1) if first_angle is not None else None,
+            "angleType": compare_key,
             "outsideFraction": round(outside_fraction, 2),
             "maxDeviation": round(max_dev, 1),
             "probableSectorExit": probable_exit,
+            "probableBoardLoss": not bool(recovered),
         })
 
-    for s in snapshots:
-        ts = s["timestamp"]
-        dbm = s["dbm"]
-        is_bad = dbm is not None and dbm <= -128
-
-        if is_bad:
+    for x in snapshots:
+        ts, dbm = x["timestamp"], x["dbm"]
+        is_lost = dbm is not None and dbm <= RADIO_LINK_LOST_DBM
+        if is_lost:
             if active is None:
-                active = {
-                    "start": ts,
-                    "end": ts,
-                    "positionSamples": [],
-                }
+                active = {"start": ts, "end": ts, "angleSamples": []}
             elif ts - active["end"] > ANTENNA_SAMPLE_MAX_GAP_SEC:
                 close_episode(active, False, None)
-                active = {
-                    "start": ts,
-                    "end": ts,
-                    "positionSamples": [],
-                }
+                active = {"start": ts, "end": ts, "angleSamples": []}
             active["end"] = ts
-            if s["positionAzimuth"] is not None:
-                active["positionSamples"].append((ts, s["positionAzimuth"]))
+            angle = x.get(compare_key)
+            if angle is not None:
+                active["angleSamples"].append((ts, angle))
         else:
             if active is not None:
                 close_episode(active, True, ts)
@@ -251,26 +310,35 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
 
     result["longLossEpisodes"] = long_episodes
     probable = [x for x in long_episodes if x["probableSectorExit"]]
+    unrecovered = [x for x in long_episodes if not x.get("recovered")]
+    unrecovered_sector = [x for x in probable if not x.get("recovered")]
     result["probableSectorExitCount"] = len(probable)
+    result["probableBoardLoss"] = bool(unrecovered)
+    result["probableBoardLossDueSector"] = bool(unrecovered_sector)
     if probable:
         result["firstProbableExitTimestamp"] = probable[0]["start"]
         result["maxDeviation"] = max(x["maxDeviation"] for x in probable)
 
-    # 3) Annotate rows. Red only when the confirmed long -128 episode and the
-    # geometric azimuth are both outside the inferred sector.
+    # --------------------------------------------------------
+    # 3) Анотація Timeline.
+    # --------------------------------------------------------
     for ev in raw_timeline:
         ts = ev.get("timestamp")
-        pos_az = ev.get("positionAzimuth")
         dbm = ev.get("dbm")
+        state = radio_state_from_dbm(dbm)
+        ev["radioState"] = state
+        ev["radioStateText"] = radio_state_text(state)
+
         if ts is None:
             ev["antennaSector"] = None
             continue
 
         episode = next((x for x in long_episodes if x["start"] <= ts <= x["end"]), None)
+        angle = ev.get(compare_key)
         dev = None
         outside = False
-        if reference is not None and valid_number(pos_az):
-            dev = heading_difference_deg(float(pos_az), reference)
+        if reference is not None and valid_number(angle):
+            dev = heading_difference_deg(float(angle), reference)
             outside = dev is not None and dev > ANTENNA_HALF_ANGLE_DEG
 
         probable_here = bool(
@@ -278,19 +346,24 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
             and episode.get("probableSectorExit")
             and outside
             and valid_number(dbm)
-            and float(dbm) <= -128
+            and float(dbm) <= RADIO_LINK_LOST_DBM
         )
 
         ev["antennaSector"] = {
             "available": result["available"],
+            "method": result["method"],
             "center": result["center"],
             "sectorMin": result["sectorMin"],
             "sectorMax": result["sectorMax"],
-            "positionAzimuth": round(float(pos_az), 1) if valid_number(pos_az) else None,
+            "positionAzimuth": ev.get("positionAzimuth"),
+            "heading": ev.get("azimuth"),
+            "comparisonAngle": round(float(angle), 1) if valid_number(angle) else None,
+            "angleType": compare_key,
             "deviation": round(float(dev), 1) if dev is not None else None,
             "outside": outside,
             "longLoss": episode is not None,
             "probableSectorExit": probable_here,
+            "probableBoardLoss": bool(episode and not episode.get("recovered")),
             "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
         }
 
@@ -1682,6 +1755,8 @@ async def analyze(file: UploadFile = File(...)):
                     "curr": ev["curr"],
                     "rssi": ev["rssi"],
                     "dbm": ev["dbm"],
+                    "radioState": ev.get("radioState"),
+                    "radioStateText": ev.get("radioStateText"),
                     "temp": ev["temp"],
                     "esc": ev["esc"],
                     "vibration": ev.get("vibration"),
@@ -1832,20 +1907,33 @@ async def analyze(file: UploadFile = File(...)):
                 "Висота продовжувала визначатися іншими джерелами."
             )
 
-        # Radio
+        # Radio / video-link quality by dBm
         if radio_status_seen:
-            if max_radio_bad_duration >= RADIO_DROPOUT_CRITICAL_SEC:
-                ai_alerts.append(
-                    "📡 <b>Аномалія RADIO_STATUS:</b> "
-                    f"граничні/нульові значення тривали до "
-                    f"{round(max_radio_bad_duration, 2)} с. "
-                    "Фактична втрата керування цим параметром не підтверджена."
-                )
-            elif radio_bad_samples > 0:
-                ai_alerts.append(
-                    "📶 <b>RADIO_STATUS:</b> були короткі граничні "
-                    "значення; одиничний -128 не трактується як втрата борта."
-                )
+            if min_dbm != 0:
+                worst_state = radio_state_from_dbm(min_dbm)
+                if worst_state == "LINK_LOST":
+                    ai_alerts.append(
+                        "🔴 <b>Радіолінія:</b> зафіксовано -128 dBm — "
+                        "за прийнятою логікою відсутні відео та телеметрія."
+                    )
+                elif worst_state == "VERY_WEAK_TELEMETRY":
+                    ai_alerts.append(
+                        f"🔴 <b>Дуже слабка телеметрія:</b> мінімум {round(min_dbm)} dBm. "
+                        "Це нижче -100 dBm, але повна втрата лінка фіксується лише при -128 dBm."
+                    )
+                elif worst_state == "VIDEO_LOST_TELEMETRY_OK":
+                    ai_alerts.append(
+                        f"🟠 <b>Втрата відео:</b> сигнал погіршувався до {round(min_dbm)} dBm; "
+                        "за прийнятою логікою телеметрія ще могла бути присутня."
+                    )
+                elif worst_state == "VIDEO_DEGRADED":
+                    ai_alerts.append(
+                        f"🟡 <b>Підсипання відео:</b> сигнал погіршувався до {round(min_dbm)} dBm."
+                    )
+                else:
+                    ai_alerts.append(
+                        f"✅ <b>Радіолінія:</b> мінімум {round(min_dbm)} dBm — робоча зона до -85 dBm."
+                    )
 
         # Video
         if curr_video_freq is not None:
@@ -1949,39 +2037,61 @@ async def analyze(file: UploadFile = File(...)):
                         f"різниця між ESC становила {round(spread, 1)} °C."
                     )
 
-        # Antenna direction inferred from position azimuth + radio signal
+        # Antenna direction + long -128 correlation
         if antenna_analysis.get("available"):
             center = antenna_analysis["center"]
             smin = antenna_analysis["sectorMin"]
             smax = antenna_analysis["sectorMax"]
             confidence = antenna_analysis.get("confidence", 0)
+            method = antenna_analysis.get("method")
             episodes = antenna_analysis.get("longLossEpisodes", [])
             probable = [x for x in episodes if x.get("probableSectorExit")]
+            unrecovered = [x for x in episodes if not x.get("recovered")]
+            unrecovered_sector = [x for x in probable if not x.get("recovered")]
 
+            method_text = (
+                "LOCAL_POSITION_NED + dBm"
+                if method == "POSITION_NED"
+                else "Heading БПЛА + dBm (резервна евристика)"
+            )
             ai_alerts.append(
                 "📡 <b>Розрахунковий напрямок АС:</b> "
-                f"≈ {center:.1f}°. Для кута розкриття {ANTENNA_BEAM_WIDTH_DEG:.0f}° "
-                f"розрахунковий сектор {smin:.1f}°–{smax:.1f}°. "
-                f"Оцінка побудована за LOCAL_POSITION_NED + dBm "
-                f"({antenna_analysis.get('radioSampleCount', 0)} радіозразків; "
-                f"умовна впевненість {confidence}%)."
+                f"≈ {center:.1f}°. Кут розкриття {ANTENNA_BEAM_WIDTH_DEG:.0f}°, "
+                f"умовний сектор {smin:.1f}°–{smax:.1f}°. "
+                f"Метод: {method_text}; {antenna_analysis.get('radioSampleCount', 0)} зразків; "
+                f"умовна впевненість {confidence}%."
             )
 
-            if probable:
-                first = probable[0]
-                first_time = format_timeline_time(first["start"], base_t)
-                recovery_text = (
-                    "Зв'язок надалі відновився."
-                    if first.get("recovered")
-                    else "До кінця цього епізоду відновлення зв'язку не підтверджено."
-                )
+            if unrecovered_sector:
+                first = unrecovered_sector[0]
+                t0 = format_timeline_time(first["start"], base_t)
+                angle_name = "позиційний азимут" if first.get("angleType") == "positionAzimuth" else "Heading"
                 ai_alerts.append(
-                    "🚨 <b>Ймовірний вихід із зони ефективного покриття АС:</b> "
-                    f"від {first_time} dBm = -128 утримувався {first['duration']:.1f} с. "
-                    f"У {round(first['outsideFraction'] * 100)}% доступних позиційних зразків "
-                    "борт знаходився поза розрахунковим сектором АС; "
+                    "🚨 <b>ВИСОКА ЙМОВІРНІСТЬ ВТРАТИ БПЛА ЧЕРЕЗ ВИХІД ІЗ ЗОНИ ЕФЕКТИВНОГО ПОКРИТТЯ АС:</b> "
+                    f"від {t0} зафіксовано безперервний -128 dBm тривалістю {first['duration']:.1f} с "
+                    "без подальшого відновлення. "
+                    f"У {round(first['outsideFraction'] * 100)}% доступних зразків {angle_name} був поза умовним сектором АС; "
                     f"максимальне відхилення від осі ≈ {first['maxDeviation']:.1f}°. "
-                    f"{recovery_text} Це ймовірнісна оцінка, а не пряме вимірювання положення антени."
+                    "Сукупність ознак відповідає ймовірній втраті борта після виходу із зони ефективного покриття АС."
+                )
+                is_critical = True
+            elif unrecovered:
+                first = unrecovered[0]
+                t0 = format_timeline_time(first["start"], base_t)
+                ai_alerts.append(
+                    "🚨 <b>ЙМОВІРНА ВТРАТА БПЛА:</b> "
+                    f"-128 dBm тривав {first['duration']:.1f} с від {t0} і не відновився до кінця TLOG. "
+                    "Вихід за сектор АС геометрично/по Heading не підтверджений достатньо впевнено."
+                )
+                is_critical = True
+            elif probable:
+                first = probable[0]
+                t0 = format_timeline_time(first["start"], base_t)
+                ai_alerts.append(
+                    "⚠️ <b>Ймовірний тимчасовий вихід із зони ефективного покриття АС:</b> "
+                    f"від {t0} -128 dBm тривав {first['duration']:.1f} с; "
+                    f"{round(first['outsideFraction'] * 100)}% зразків були поза сектором. "
+                    "Зв'язок надалі відновився, тому втрата борта не підтверджена."
                 )
             elif episodes:
                 longest = max(episodes, key=lambda x: x["duration"])
@@ -1990,19 +2100,17 @@ async def analyze(file: UploadFile = File(...)):
                 ai_alerts.append(
                     "⚠️ <b>Тривала втрата радіоканалу:</b> "
                     f"-128 dBm від {t0}, тривалість {longest['duration']:.1f} с; {rec}. "
-                    "За геометричним азимутом недостатньо ознак, щоб пов'язати цю подію "
-                    "саме з виходом за сектор АС."
+                    "Недостатньо ознак, щоб пов'язати її саме з виходом за сектор АС."
                 )
             else:
                 ai_alerts.append(
-                    f"✅ <b>Тривалої втрати -128 dBm понад {RADIO_LONG_LOSS_SEC:.0f} с "
-                    "у поєднанні з виходом за розрахунковий сектор АС не зафіксовано.</b>"
+                    f"✅ <b>Безперервного -128 dBm понад {RADIO_LONG_LOSS_SEC:.0f} с "
+                    "у поєднанні з виходом за умовний сектор АС не зафіксовано.</b>"
                 )
         elif ever_armed:
             ai_alerts.append(
                 "ℹ️ <b>Напрямок АС автоматично не визначено:</b> "
-                "недостатньо одночасних даних LOCAL_POSITION_NED, дальності та коректного dBm. "
-                "Для цієї оцінки NED-origin має знаходитися біля антенної станції."
+                "недостатньо даних і для LOCAL_POSITION_NED + dBm, і для резервної оцінки Heading + dBm."
             )
 
         # Attitude
@@ -2087,6 +2195,7 @@ async def analyze(file: UploadFile = File(...)):
                 "smartRtlBadPositionCount": smart_rtl_bad_position_count,
                 "antennaAnalysis": {
                     "available": antenna_analysis.get("available", False),
+                    "method": antenna_analysis.get("method"),
                     "center": antenna_analysis.get("center"),
                     "sectorMin": antenna_analysis.get("sectorMin"),
                     "sectorMax": antenna_analysis.get("sectorMax"),
@@ -2096,6 +2205,9 @@ async def analyze(file: UploadFile = File(...)):
                     "longLossEpisodeCount": len(antenna_analysis.get("longLossEpisodes", [])),
                     "probableSectorExitCount": antenna_analysis.get("probableSectorExitCount", 0),
                     "maxDeviation": antenna_analysis.get("maxDeviation", 0.0),
+                    "probableBoardLoss": antenna_analysis.get("probableBoardLoss", False),
+                    "probableBoardLossDueSector": antenna_analysis.get("probableBoardLossDueSector", False),
+                    "longLossEpisodes": antenna_analysis.get("longLossEpisodes", []),
                 },
                 "alerts": ai_alerts,
             },
