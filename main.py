@@ -3,6 +3,7 @@ import math
 import os
 import tempfile
 import re
+import statistics
 
 from fastapi import FastAPI, File, UploadFile
 from pymavlink import mavutil
@@ -63,6 +64,15 @@ ANTENNA_MIN_DISTANCE_M = 10.0
 ANTENNA_MIN_RADIO_SAMPLES = 15
 ANTENNA_TOP_SIGNAL_FRACTION = 0.30
 ANTENNA_SAMPLE_MAX_GAP_SEC = 2.2
+
+# 5-ознакова модель ймовірного виходу БПЛА за сектор АС.
+# Це НЕ окремий "датчик", а сукупність незалежних ознак.
+ANTENNA_TREND_LOOKBACK_SEC = 15.0
+ANTENNA_TREND_MIN_SAMPLES = 5
+ANTENNA_DEVIATION_GROWTH_MIN_DEG = 3.0
+ANTENNA_DBM_WORSEN_MIN_DB = 5.0
+ANTENNA_DBM_WORSEN_MIN_SLOPE_DB_PER_SEC = 0.20
+ANTENNA_DBM_WORSEN_MIN_FRACTION = 0.60
 
 CH7_REVERSED = False
 CH8_REVERSED = False
@@ -182,6 +192,12 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         "maxDeviation": 0.0,
         "probableBoardLoss": False,
         "probableBoardLossDueSector": False,
+
+        # Five-sign evidence model.
+        "sectorEvidenceEpisodes": [],
+        "strongestSectorEvidence": None,
+        "sectorEvidenceScore": 0,
+        "sectorEvidenceLevel": "NONE",
     }
 
     if arm_timestamp is None:
@@ -270,6 +286,266 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
         result["center"] = round(reference, 1)
         result["sectorMin"] = round((reference - ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
         result["sectorMax"] = round((reference + ANTENNA_HALF_ANGLE_DEG) % 360.0, 1)
+
+    # --------------------------------------------------------
+    # 2) 5 ОЗНАК ВИХОДУ ЗА СЕКТОР АС
+    #
+    # 1. Геометричний вихід за межу сектора.
+    # 2. Відхилення від осі АС продовжує збільшуватись.
+    # 3. dBm має стійкий тренд на погіршення.
+    # 4. Сигнал доходить до -128 dBm.
+    # 5. Після виходу немає повернення в сектор АБО немає
+    #    відновлення радіоканалу після -128.
+    #
+    # Важливо: одна ознака сама по собі НЕ є доказом втрати БПЛА.
+    # --------------------------------------------------------
+    evidence_episodes = []
+
+    def median_or_none(values):
+        vals = [float(v) for v in values if valid_number(v)]
+        if not vals:
+            return None
+        return float(statistics.median(vals))
+
+    def linear_slope(samples):
+        """Least-squares slope y/sec for [(timestamp, value), ...]."""
+        pts = [(float(t), float(v)) for t, v in samples if valid_number(t) and valid_number(v)]
+        if len(pts) < 2:
+            return None
+        t0 = pts[0][0]
+        xs = [t - t0 for t, _ in pts]
+        ys = [v for _, v in pts]
+        xbar = sum(xs) / len(xs)
+        ybar = sum(ys) / len(ys)
+        den = sum((x - xbar) ** 2 for x in xs)
+        if den <= 1e-9:
+            return None
+        return sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys)) / den
+
+    def fraction_worsening(values):
+        vals = [float(v) for v in values if valid_number(v)]
+        if len(vals) < 2:
+            return 0.0
+        # dBm "погіршується", коли число стає більш від'ємним.
+        worsened = sum(1 for a, b in zip(vals, vals[1:]) if b <= a)
+        return worsened / max(1, len(vals) - 1)
+
+    # Enrich snapshots with angular deviation / inside-outside.
+    for x in snapshots:
+        angle = x.get(compare_key)
+        dev = None
+        outside = False
+        if reference is not None and valid_number(angle):
+            dev = heading_difference_deg(float(angle), reference)
+            outside = dev is not None and dev > ANTENNA_HALF_ANGLE_DEG
+        x["sectorDeviation"] = dev
+        x["outsideSector"] = outside
+
+    if reference is not None and snapshots:
+        # Build contiguous geometric outside-sector runs.
+        runs = []
+        active_run = None
+
+        for idx, x in enumerate(snapshots):
+            if x.get("outsideSector"):
+                if active_run is None:
+                    active_run = {
+                        "startIndex": idx,
+                        "endIndex": idx,
+                        "start": x["timestamp"],
+                        "end": x["timestamp"],
+                    }
+                elif x["timestamp"] - snapshots[active_run["endIndex"]]["timestamp"] <= ANTENNA_SAMPLE_MAX_GAP_SEC * 2.5:
+                    active_run["endIndex"] = idx
+                    active_run["end"] = x["timestamp"]
+                else:
+                    runs.append(active_run)
+                    active_run = {
+                        "startIndex": idx,
+                        "endIndex": idx,
+                        "start": x["timestamp"],
+                        "end": x["timestamp"],
+                    }
+            elif active_run is not None:
+                runs.append(active_run)
+                active_run = None
+
+        if active_run is not None:
+            runs.append(active_run)
+
+        for run in runs:
+            start_i = run["startIndex"]
+            end_i = run["endIndex"]
+            start_ts = run["start"]
+            end_ts = run["end"]
+
+            # Include a look-back window before the geometric exit so the
+            # dBm/deviation trend can show the approach to the sector edge.
+            trend_start_ts = start_ts - ANTENNA_TREND_LOOKBACK_SEC
+            trend_samples = [
+                x for x in snapshots
+                if trend_start_ts <= x["timestamp"] <= end_ts
+            ]
+            outside_samples = snapshots[start_i:end_i + 1]
+
+            deviations = [
+                float(x["sectorDeviation"])
+                for x in trend_samples
+                if valid_number(x.get("sectorDeviation"))
+            ]
+            dbm_samples = [
+                (x["timestamp"], float(x["dbm"]))
+                for x in trend_samples
+                if valid_number(x.get("dbm")) and float(x["dbm"]) < 0
+            ]
+
+            # SIGN 1: geometric outside-sector.
+            sign1_outside = bool(outside_samples)
+
+            # SIGN 2: angular deviation keeps growing.
+            sign2_dev_growing = False
+            dev_growth = None
+            dev_slope = None
+            if len(deviations) >= ANTENNA_TREND_MIN_SAMPLES:
+                chunk = max(1, len(deviations) // 3)
+                first_med = median_or_none(deviations[:chunk])
+                last_med = median_or_none(deviations[-chunk:])
+                if first_med is not None and last_med is not None:
+                    dev_growth = last_med - first_med
+                dev_slope = linear_slope([
+                    (x["timestamp"], x["sectorDeviation"])
+                    for x in trend_samples
+                    if valid_number(x.get("sectorDeviation"))
+                ])
+                sign2_dev_growing = bool(
+                    dev_growth is not None
+                    and dev_growth >= ANTENNA_DEVIATION_GROWTH_MIN_DEG
+                    and (dev_slope is None or dev_slope > 0)
+                )
+
+            # SIGN 3: stable worsening dBm trend.
+            sign3_dbm_worsening = False
+            dbm_drop = None
+            dbm_slope = None
+            dbm_worse_fraction = 0.0
+            if len(dbm_samples) >= ANTENNA_TREND_MIN_SAMPLES:
+                dbm_values = [v for _, v in dbm_samples]
+                chunk = max(1, len(dbm_values) // 3)
+                first_med = median_or_none(dbm_values[:chunk])
+                last_med = median_or_none(dbm_values[-chunk:])
+                if first_med is not None and last_med is not None:
+                    # Positive number means signal got worse by N dB.
+                    dbm_drop = first_med - last_med
+                dbm_slope = linear_slope(dbm_samples)
+                dbm_worse_fraction = fraction_worsening(dbm_values)
+
+                sign3_dbm_worsening = bool(
+                    dbm_drop is not None
+                    and dbm_drop >= ANTENNA_DBM_WORSEN_MIN_DB
+                    and dbm_slope is not None
+                    and dbm_slope <= -ANTENNA_DBM_WORSEN_MIN_SLOPE_DB_PER_SEC
+                    and dbm_worse_fraction >= ANTENNA_DBM_WORSEN_MIN_FRACTION
+                )
+
+            # SIGN 4: reaches complete-loss indicator -128 dBm.
+            sign4_reaches_128 = any(
+                valid_number(x.get("dbm")) and float(x["dbm"]) <= RADIO_LINK_LOST_DBM
+                for x in trend_samples
+            )
+
+            # SIGN 5: after geometric exit there is no geometric return OR
+            # after reaching -128 there is no radio recovery.
+            future = snapshots[end_i + 1:]
+            returned_to_sector = any(
+                not bool(x.get("outsideSector"))
+                for x in future
+                if valid_number(x.get(compare_key))
+            )
+
+            radio_recovered_after_128 = False
+            if sign4_reaches_128:
+                first_128_ts = next(
+                    (
+                        x["timestamp"]
+                        for x in trend_samples
+                        if valid_number(x.get("dbm"))
+                        and float(x["dbm"]) <= RADIO_LINK_LOST_DBM
+                    ),
+                    None,
+                )
+                if first_128_ts is not None:
+                    radio_recovered_after_128 = any(
+                        valid_number(x.get("dbm"))
+                        and float(x["dbm"]) > RADIO_LINK_LOST_DBM
+                        for x in snapshots
+                        if x["timestamp"] > first_128_ts
+                    )
+
+            sign5_no_return_or_recovery = bool(
+                (not returned_to_sector)
+                or (sign4_reaches_128 and not radio_recovered_after_128)
+            )
+
+            signs = {
+                "outsideSector": sign1_outside,
+                "deviationGrowing": sign2_dev_growing,
+                "dbmWorsening": sign3_dbm_worsening,
+                "reachedMinus128": sign4_reaches_128,
+                "noReturnOrRecovery": sign5_no_return_or_recovery,
+            }
+            score = sum(1 for v in signs.values() if v)
+
+            if score >= 5:
+                level = "VERY_HIGH"
+            elif score >= 4:
+                level = "HIGH"
+            elif score >= 3:
+                level = "MEDIUM"
+            elif score >= 2:
+                level = "LOW"
+            else:
+                level = "WEAK"
+
+            evidence_episodes.append({
+                "start": start_ts,
+                "end": end_ts,
+                "duration": round(max(0.0, end_ts - start_ts), 2),
+                "score": score,
+                "maxScore": 5,
+                "level": level,
+                "signs": signs,
+                "firstOutsideAngle": round(float(outside_samples[0].get(compare_key)), 1)
+                    if outside_samples and valid_number(outside_samples[0].get(compare_key)) else None,
+                "maxDeviation": round(
+                    max(
+                        [float(x["sectorDeviation"]) for x in outside_samples if valid_number(x.get("sectorDeviation"))]
+                        or [0.0]
+                    ),
+                    1,
+                ),
+                "deviationGrowth": round(dev_growth, 1) if dev_growth is not None else None,
+                "deviationSlopeDegPerSec": round(dev_slope, 3) if dev_slope is not None else None,
+                "dbmDrop": round(dbm_drop, 1) if dbm_drop is not None else None,
+                "dbmSlopePerSec": round(dbm_slope, 3) if dbm_slope is not None else None,
+                "dbmWorseningFraction": round(dbm_worse_fraction, 2),
+                "returnedToSector": returned_to_sector,
+                "radioRecoveredAfterMinus128": radio_recovered_after_128,
+            })
+
+        if evidence_episodes:
+            # Prefer higher score; for equal score prefer larger deviation and later/longer evidence.
+            strongest = max(
+                evidence_episodes,
+                key=lambda ep: (
+                    ep.get("score", 0),
+                    ep.get("maxDeviation", 0.0),
+                    ep.get("duration", 0.0),
+                ),
+            )
+            result["sectorEvidenceEpisodes"] = evidence_episodes
+            result["strongestSectorEvidence"] = strongest
+            result["sectorEvidenceScore"] = strongest.get("score", 0)
+            result["sectorEvidenceLevel"] = strongest.get("level", "NONE")
 
     # --------------------------------------------------------
     # 2) Безперервні епізоди -128 dBm >= 60 с.
@@ -378,6 +654,17 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
             and float(dbm) <= RADIO_LINK_LOST_DBM
         )
 
+        # Find the matching five-sign geometric exit episode, if any.
+        evidence_here = next(
+            (
+                ep for ep in result.get("sectorEvidenceEpisodes", [])
+                if ep.get("start") is not None
+                and ep.get("end") is not None
+                and float(ep["start"]) <= float(ts) <= float(ep["end"])
+            ),
+            None,
+        )
+
         ev["antennaSector"] = {
             "available": result["available"],
             "method": result["method"],
@@ -394,6 +681,9 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
             "probableSectorExit": probable_here,
             "probableBoardLoss": bool(episode and not episode.get("recovered")),
             "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
+            "evidenceScore": evidence_here.get("score", 0) if evidence_here else 0,
+            "evidenceLevel": evidence_here.get("level") if evidence_here else None,
+            "evidenceSigns": evidence_here.get("signs") if evidence_here else None,
         }
 
     return result
@@ -3134,6 +3424,45 @@ async def analyze(file: UploadFile = File(...)):
                 f"умовна впевненість {confidence}%."
             )
 
+            strongest_evidence = antenna_analysis.get("strongestSectorEvidence")
+            if strongest_evidence and strongest_evidence.get("score", 0) >= 2:
+                ev_score = int(strongest_evidence.get("score", 0))
+                ev_signs = strongest_evidence.get("signs") or {}
+                ev_t0 = format_timeline_time(strongest_evidence["start"], base_t)
+
+                sign_labels = []
+                if ev_signs.get("outsideSector"):
+                    sign_labels.append("геометричний вихід за сектор")
+                if ev_signs.get("deviationGrowing"):
+                    sign_labels.append("відхилення від осі АС збільшувалось")
+                if ev_signs.get("dbmWorsening"):
+                    drop = strongest_evidence.get("dbmDrop")
+                    if valid_number(drop):
+                        sign_labels.append(f"dBm стійко погіршувався приблизно на {float(drop):.1f} dB")
+                    else:
+                        sign_labels.append("dBm мав стійкий тренд на погіршення")
+                if ev_signs.get("reachedMinus128"):
+                    sign_labels.append("сигнал дійшов до -128 dBm")
+                if ev_signs.get("noReturnOrRecovery"):
+                    sign_labels.append("не зафіксовано повернення в сектор або відновлення після втрати")
+
+                level_text = {
+                    "VERY_HIGH": "дуже висока",
+                    "HIGH": "висока",
+                    "MEDIUM": "середня",
+                    "LOW": "низька",
+                    "WEAK": "слабка",
+                }.get(strongest_evidence.get("level"), "невизначена")
+
+                ai_alerts.append(
+                    "📐 <b>Оцінка виходу за сектор АС за 5 ознаками:</b> "
+                    f"{ev_score}/5, {level_text} сукупна ймовірність. "
+                    f"Початок епізоду ≈ {ev_t0}; "
+                    f"максимальне відхилення від осі ≈ {strongest_evidence.get('maxDeviation', 0):.1f}°. "
+                    "Ознаки: " + "; ".join(sign_labels) + ". "
+                    "Оцінка є ймовірнісною: окремий фактор сам по собі не доводить причину втрати зв'язку."
+                )
+
             if unrecovered_sector:
                 first = unrecovered_sector[0]
                 t0 = format_timeline_time(first["start"], base_t)
@@ -3489,6 +3818,10 @@ async def analyze(file: UploadFile = File(...)):
                     "maxDeviation": antenna_analysis.get("maxDeviation", 0.0),
                     "probableBoardLoss": antenna_analysis.get("probableBoardLoss", False),
                     "probableBoardLossDueSector": antenna_analysis.get("probableBoardLossDueSector", False),
+                    "sectorEvidenceScore": antenna_analysis.get("sectorEvidenceScore", 0),
+                    "sectorEvidenceLevel": antenna_analysis.get("sectorEvidenceLevel", "NONE"),
+                    "strongestSectorEvidence": antenna_analysis.get("strongestSectorEvidence"),
+                    "sectorEvidenceEpisodes": antenna_analysis.get("sectorEvidenceEpisodes", []),
                     "longLossEpisodes": antenna_analysis.get("longLossEpisodes", []),
                 },
                 "alerts": ai_alerts,
