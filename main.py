@@ -1038,6 +1038,12 @@ async def analyze(file: UploadFile = File(...)):
         curr_dist = 0.0
         curr_azimuth = None  # aircraft Heading from VFR_HUD
         curr_position_azimuth = None  # geometric NED azimuth from origin to aircraft
+
+        # Raw LOCAL_POSITION_NED coordinates for 2D map.
+        curr_ned_north = None
+        curr_ned_east = None
+        curr_ned_down = None
+
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -1357,6 +1363,9 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
+                    "nedNorth": round(curr_ned_north, 3) if curr_ned_north is not None else None,
+                    "nedEast": round(curr_ned_east, 3) if curr_ned_east is not None else None,
+                    "nedDown": round(curr_ned_down, 3) if curr_ned_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1410,6 +1419,9 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
+                    "nedNorth": round(curr_ned_north, 3) if curr_ned_north is not None else None,
+                    "nedEast": round(curr_ned_east, 3) if curr_ned_east is not None else None,
+                    "nedDown": round(curr_ned_down, 3) if curr_ned_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1878,6 +1890,10 @@ async def analyze(file: UploadFile = File(...)):
                     x = float(x)
                     y = float(y)
                     z = float(z)
+
+                    curr_ned_north = x
+                    curr_ned_east = y
+                    curr_ned_down = z
 
                     d_val = math.sqrt(x * x + y * y)
 
@@ -2924,6 +2940,9 @@ async def analyze(file: UploadFile = File(...)):
                     "dist": ev["dist"],
                     "azimuth": ev.get("azimuth"),
                     "positionAzimuth": ev.get("positionAzimuth"),
+                    "nedNorth": ev.get("nedNorth"),
+                    "nedEast": ev.get("nedEast"),
+                    "nedDown": ev.get("nedDown"),
                     "antennaSector": ev.get("antennaSector"),
                     "vtxBand": ev.get("vtxBand"),
                     "vtxChannel": ev.get("vtxChannel"),
