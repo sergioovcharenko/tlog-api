@@ -45,6 +45,10 @@ LAND_SPEED_RATIO_WARNING = 1.35
 LAND_SPEED_MIN_ABNORMAL_MPS = 1.5
 LAND_FREEFALL_ACCEL_MPS2 = 2.5
 LAND_ANALYSIS_MIN_SAMPLES = 5
+
+# Ground/calibration context.
+GROUND_CAL_ATT_IGNORE_DURING_ACCEL_CAL = True
+GROUND_RADIO_LOSS_NEVER_MEANS_AIRCRAFT_LOSS = True
 FLIGHT_TAKEOFF_ALT_M = 2.0
 FLIGHT_LANDED_ALT_M = 0.8
 FLIGHT_MIN_AIRBORNE_SEC = 1.5
@@ -830,6 +834,14 @@ async def analyze(file: UploadFile = File(...)):
         rpm_pair_active = {"1-2": False, "3-4": False}
         potential_thrust_loss_events = []
 
+        # Ground calibration context.
+        accel_calibration_events = []
+        accel_calibration_active = False
+        accel_calibration_success = False
+        accel_calibration_requires_reboot = False
+        accel_calibration_start_ts = None
+        accel_calibration_end_ts = None
+
         # Optical navigation / EKF
         # First false coordinates do not have to be exact zeroes.
         optical_zero_detected = False  # compatibility field
@@ -1185,6 +1197,10 @@ async def analyze(file: UploadFile = File(...)):
             nonlocal loiter_position_fail_count, external_nav_recovery_count
             nonlocal smart_rtl_bad_position_count, prearm_position_count
             nonlocal potential_thrust_loss_events
+            nonlocal accel_calibration_active, accel_calibration_success
+            nonlocal accel_calibration_requires_reboot
+            nonlocal accel_calibration_start_ts, accel_calibration_end_ts
+            nonlocal accel_calibration_events
 
             txt_lower = full_txt.lower()
 
@@ -1208,6 +1224,38 @@ async def analyze(file: UploadFile = File(...)):
 
             if "prearm: need position estimate" in txt_lower:
                 prearm_position_count += 1
+
+            # Detect accelerometer calibration sequence.
+            # Typical ArduPilot messages include positioning instructions,
+            # 'Calibration successful', and 'Accels calibrated requires reboot'.
+            accel_markers = (
+                "place vehicle level",
+                "place vehicle on its left side",
+                "place vehicle on its right side",
+                "place vehicle nose down",
+                "place vehicle nose up",
+                "place vehicle on its back",
+                "calibration successful",
+                "accels calibrated requires reboot",
+            )
+
+            if any(marker in txt_lower for marker in accel_markers):
+                if accel_calibration_start_ts is None:
+                    accel_calibration_start_ts = timestamp
+
+                accel_calibration_active = True
+                accel_calibration_events.append({
+                    "timestamp": timestamp,
+                    "text": full_txt,
+                })
+
+                if "calibration successful" in txt_lower:
+                    accel_calibration_success = True
+                    accel_calibration_end_ts = timestamp
+
+                if "accels calibrated requires reboot" in txt_lower:
+                    accel_calibration_requires_reboot = True
+                    accel_calibration_end_ts = timestamp
 
             # Potential Thrust Loss is a warning candidate, not automatic proof
             # of motor failure. Correlate it later with RPM / ATT / VIB.
@@ -1709,6 +1757,17 @@ async def analyze(file: UploadFile = File(...)):
                         abs(curr_roll) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
                         or abs(curr_pitch) >= ATTITUDE_CRITICAL_THRESHOLD_DEG
                     )
+
+                    # During accelerometer calibration the vehicle is intentionally
+                    # placed on its sides / nose / back. Large Roll/Pitch is normal
+                    # in this context and must NOT become a flight-critical ATT event.
+                    if (
+                        GROUND_CAL_ATT_IGNORE_DURING_ACCEL_CAL
+                        and not is_currently_armed
+                        and accel_calibration_active
+                    ):
+                        crit = False
+
                     peak = max(abs(curr_roll), abs(curr_pitch))
 
                     if crit:
@@ -2462,6 +2521,35 @@ async def analyze(file: UploadFile = File(...)):
         flight_sessions = analyze_flight_sessions(raw_timeline, current_timestamp)
         first_flight_arm_timestamp = flight_sessions[0]["armTimestamp"] if flight_sessions else arm_timestamp
 
+        # Add derived Timeline markers for accelerometer calibration.
+        if accel_calibration_events:
+            for idx, cal_ev in enumerate(accel_calibration_events):
+                raw_timeline.append({
+                    "timestamp": cal_ev["timestamp"],
+                    "mode": current_mode,
+                    "alt": float(curr_alt) if valid_number(curr_alt) else 0.0,
+                    "dist": float(curr_dist) if valid_number(curr_dist) else 0.0,
+                    "volt": float(curr_voltage) if valid_number(curr_voltage) else None,
+                    "curr": float(curr_amp) if valid_number(curr_amp) else None,
+                    "dbm": curr_dbm,
+                    "esc": esc_snapshot(),
+                    "vibration": vibration_snapshot(),
+                    "attitude": attitude_snapshot(),
+                    "rpmAnalysis": rpm_analysis_snapshot(),
+                    "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
+                    "system_text": "",
+                    "analysis_text": (
+                        "🧭 Проводилось калібрування акселерометра"
+                        if idx == 0
+                        else f"🧭 Калібрування акселерометра: {cal_ev['text']}"
+                    ),
+                    "pilot_text": "",
+                    "is_error": False,
+                    "eventType": "ACCEL_CALIBRATION",
+                })
+
+            raw_timeline.sort(key=lambda e: e.get("timestamp", 0))
+
         # Estimate antenna pointing from NED position azimuth + dBm.
         antenna_analysis = analyze_antenna_direction(raw_timeline, first_flight_arm_timestamp)
 
@@ -2541,6 +2629,12 @@ async def analyze(file: UploadFile = File(...)):
         ai_alerts = []
         is_critical = False
 
+        # High-level context has priority over flight-only heuristics.
+        ground_session = not ever_armed
+        accelerometer_calibration_session = bool(
+            ground_session and accel_calibration_events
+        )
+
         # Завершення польоту / LAND -> automatic DISARM
         if disarm_detected:
             if disarm_mode == "LAND":
@@ -2602,8 +2696,58 @@ async def analyze(file: UploadFile = File(...)):
                         f"{ep_t}{endtxt}; MAX ALT епізоду {float(ep.get('maxAltitude') or 0):.1f} м. "
                         "Натисніть, щоб перейти до рядка Timeline.</span>"
                     )
+        # Ground / accelerometer calibration context.
+
+        if accel_calibration_events:
+            cal_start = (
+                format_timeline_time(accel_calibration_start_ts, base_t)
+                if accel_calibration_start_ts is not None
+                else "—"
+            )
+            cal_end = (
+                format_timeline_time(accel_calibration_end_ts, base_t)
+                if accel_calibration_end_ts is not None
+                else "—"
+            )
+
+            if accel_calibration_success:
+                status_text = "калібрування завершилось успішно"
+            else:
+                status_text = "процедуру калібрування зафіксовано, але повідомлення про успішне завершення не знайдено"
+
+            reboot_text = (
+                " Після калібрування ArduPilot повідомив, що потрібне перезавантаження."
+                if accel_calibration_requires_reboot
+                else ""
+            )
+
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{cal_start}">'
+                "🧭 <b>Проводилось калібрування акселерометра.</b> "
+                f"Початок процедури: {cal_start}; завершення: {cal_end}. "
+                f"{status_text}.{reboot_text} "
+                "Під час калібрування БПЛА штатно встановлюють рівно, на лівий/правий бік, "
+                "носом вниз/вгору та на спину. Тому великі Roll/Pitch у цей період "
+                "є очікуваними й не класифікуються як аварійний нахил. "
+                "Натисніть, щоб перейти до початку калібрування."
+                "</span>"
+            )
+
+        if ground_session:
+            first_time = format_timeline_time(
+                first_timestamp if first_timestamp is not None else 0,
+                base_t,
+            )
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{first_time}">'
+                "ℹ️ <b>Наземна сесія:</b> ARM протягом TLOG не зафіксовано. "
+                "Тому висота, ATT, RPM, VIB та радіоподії оцінюються в наземному контексті, "
+                "а не як повноцінний політ."
+                "</span>"
+            )
+
         # LAND behavior analysis.
-        if land_analysis.get("available"):
+        if land_analysis.get("available") and not accelerometer_calibration_session:
             land_time = format_timeline_time(
                 land_analysis.get("maxDescentTimestamp"),
                 base_t,
@@ -2937,24 +3081,43 @@ async def analyze(file: UploadFile = File(...)):
                 first = unrecovered_sector[0]
                 t0 = format_timeline_time(first["start"], base_t)
                 angle_name = "позиційний азимут" if first.get("angleType") == "positionAzimuth" else "Heading"
-                ai_alerts.append(
-                    "🚨 <b>ВИСОКА ЙМОВІРНІСТЬ ВТРАТИ БПЛА ЧЕРЕЗ ВИХІД ІЗ ЗОНИ ЕФЕКТИВНОГО ПОКРИТТЯ АС:</b> "
-                    f"від {t0} зафіксовано безперервний -128 dBm тривалістю {first['duration']:.1f} с "
-                    "без подальшого відновлення. "
-                    f"У {round(first['outsideFraction'] * 100)}% доступних зразків {angle_name} був поза умовним сектором АС; "
-                    f"максимальне відхилення від осі ≈ {first['maxDeviation']:.1f}°. "
-                    "Сукупність ознак відповідає ймовірній втраті борта після виходу із зони ефективного покриття АС."
-                )
-                is_critical = True
+
+                if ground_session:
+                    ai_alerts.append(
+                        "⚠️ <b>Радіоканал на землі:</b> "
+                        f"від {t0} зафіксовано безперервний -128 dBm тривалістю "
+                        f"{first['duration']:.1f} с без подальшого відновлення. "
+                        "Оскільки ARM/політ не зафіксовано, ця подія НЕ класифікується "
+                        "як втрата БПЛА. Це наземна відсутність/втрата радіолінії."
+                    )
+                else:
+                    ai_alerts.append(
+                        "🚨 <b>ВИСОКА ЙМОВІРНІСТЬ ВТРАТИ БПЛА ЧЕРЕЗ ВИХІД ІЗ ЗОНИ ЕФЕКТИВНОГО ПОКРИТТЯ АС:</b> "
+                        f"від {t0} зафіксовано безперервний -128 dBm тривалістю {first['duration']:.1f} с "
+                        "без подальшого відновлення. "
+                        f"У {round(first['outsideFraction'] * 100)}% доступних зразків {angle_name} був поза умовним сектором АС; "
+                        f"максимальне відхилення від осі ≈ {first['maxDeviation']:.1f}°. "
+                        "Сукупність ознак відповідає ймовірній втраті борта після виходу із зони ефективного покриття АС."
+                    )
+                    is_critical = True
             elif unrecovered:
                 first = unrecovered[0]
                 t0 = format_timeline_time(first["start"], base_t)
-                ai_alerts.append(
-                    "🚨 <b>ЙМОВІРНА ВТРАТА БПЛА:</b> "
-                    f"-128 dBm тривав {first['duration']:.1f} с від {t0} і не відновився до кінця TLOG. "
-                    "Вихід за сектор АС геометрично/по Heading не підтверджений достатньо впевнено."
-                )
-                is_critical = True
+
+                if ground_session:
+                    ai_alerts.append(
+                        "⚠️ <b>Тривала втрата радіоканалу на землі:</b> "
+                        f"-128 dBm тривав {first['duration']:.1f} с від {t0} "
+                        "і не відновився до кінця TLOG. "
+                        "Оскільки ARM не було, це НЕ є ознакою втрати БПЛА."
+                    )
+                else:
+                    ai_alerts.append(
+                        "🚨 <b>ЙМОВІРНА ВТРАТА БПЛА:</b> "
+                        f"-128 dBm тривав {first['duration']:.1f} с від {t0} і не відновився до кінця TLOG. "
+                        "Вихід за сектор АС геометрично/по Heading не підтверджений достатньо впевнено."
+                    )
+                    is_critical = True
             elif probable:
                 first = probable[0]
                 t0 = format_timeline_time(first["start"], base_t)
@@ -2985,7 +3148,7 @@ async def analyze(file: UploadFile = File(...)):
             )
 
         # RPM / thrust diagnostics.
-        if rpm_drop_events:
+        if rpm_drop_events and not accelerometer_calibration_session:
             strongest_rpm = max(
                 rpm_drop_events,
                 key=lambda x: x.get("differencePct", 0.0),
@@ -3017,7 +3180,7 @@ async def analyze(file: UploadFile = File(...)):
             is_critical = True
 
         # Potential Thrust Loss is correlated with RPM, but is not sufficient alone.
-        for thrust in potential_thrust_loss_events:
+        for thrust in ([] if accelerometer_calibration_session else potential_thrust_loss_events):
             thrust_time = format_timeline_time(thrust["timestamp"], base_t)
             motor = thrust.get("motor")
 
@@ -3089,7 +3252,7 @@ async def analyze(file: UploadFile = File(...)):
                     "score": score,
                 })
 
-        if impact_candidates:
+        if impact_candidates and not accelerometer_calibration_session:
             impact = max(
                 impact_candidates,
                 key=lambda x: (
@@ -3142,7 +3305,7 @@ async def analyze(file: UploadFile = File(...)):
             is_critical = True
 
         # Attitude / tilt. Threshold requested for timeline highlighting: >= 35 deg.
-        if attitude_critical_events:
+        if attitude_critical_events and not accelerometer_calibration_session:
             peak_event = max(attitude_critical_events, key=lambda x: x.get("peak", 0.0))
             peak_time = format_timeline_time(peak_event.get("timestamp"), base_t)
             ai_alerts.append(
@@ -3175,7 +3338,30 @@ async def analyze(file: UploadFile = File(...)):
             or smart_rtl_bad_position_count > 0
         )
 
-        if disarm_detected:
+        # Calibration / ground context has the highest verdict priority.
+        if accelerometer_calibration_session:
+            # Flight-only anomalies must not promote a ground calibration log
+            # to a "critical flight" verdict.
+            is_critical = False
+
+            if accel_calibration_success:
+                ai_verdict = (
+                    "🧭 НАЗЕМНА СЕСІЯ — ПРОВОДИЛОСЬ КАЛІБРУВАННЯ АКСЕЛЕРОМЕТРА. "
+                    "КАЛІБРУВАННЯ ЗАВЕРШЕНО УСПІШНО:"
+                )
+            else:
+                ai_verdict = (
+                    "🧭 НАЗЕМНА СЕСІЯ — ПРОВОДИЛОСЬ КАЛІБРУВАННЯ АКСЕЛЕРОМЕТРА. "
+                    "ПОТРІБНА ПЕРЕВІРКА ЗАВЕРШЕННЯ ПРОЦЕДУРИ:"
+                )
+
+        elif ground_session:
+            # No ARM means this is not a completed/failed flight.
+            ai_verdict = (
+                "ℹ️ НАЗЕМНА СЕСІЯ — ARM І ФАКТИЧНИЙ ПОЛІТ НЕ ЗАФІКСОВАНО:"
+            )
+
+        elif disarm_detected:
             if is_critical:
                 ai_verdict = (
                     "⚠️ БОРТ ЗАВЕРШИВ ПОЛІТ. "
@@ -3191,16 +3377,19 @@ async def analyze(file: UploadFile = File(...)):
                     "✅ БОРТ ЗАВЕРШИВ ПОЛІТ. "
                     "КРИТИЧНИХ ВІДХИЛЕНЬ НЕ ЗАФІКСОВАНО:"
                 )
+
         elif log_ended_armed:
             ai_verdict = (
                 "🚨 ЛОГ ОБІРВАВСЯ ПРИ ARMED. "
                 "ПОТРІБНА ПЕРЕВІРКА:"
             )
+
         elif is_critical:
             ai_verdict = (
                 "⚠️ ПІД ЧАС ПОЛЬОТУ ЗАФІКСОВАНО "
                 "КРИТИЧНІ ПОДІЇ:"
             )
+
         else:
             ai_verdict = "📊 ПОВНИЙ АНАЛІЗ ПОЛЬОТУ:"
 
@@ -3261,6 +3450,16 @@ async def analyze(file: UploadFile = File(...)):
                 "rpmDropEventCount": len(rpm_drop_events),
                 "potentialThrustLossCount": len(potential_thrust_loss_events),
                 "flightSessionCount": len(flight_sessions),
+                "accelCalibration": {
+                    "detected": bool(accel_calibration_events),
+                    "success": accel_calibration_success,
+                    "requiresReboot": accel_calibration_requires_reboot,
+                    "groundSession": ground_session,
+                    "isCalibrationSession": accelerometer_calibration_session,
+                    "startTimestamp": accel_calibration_start_ts,
+                    "endTimestamp": accel_calibration_end_ts,
+                    "eventCount": len(accel_calibration_events),
+                },
                 "flightSessions": flight_sessions,
                 "landAnalysis": land_analysis,
                 "landParams": {
