@@ -748,6 +748,15 @@ async def analyze(file: UploadFile = File(...)):
         curr_dist = 0.0
         curr_azimuth = None  # aircraft Heading from VFR_HUD
         curr_position_azimuth = None  # geometric NED azimuth from origin to aircraft
+        curr_north = None
+        curr_east = None
+        curr_down = None
+
+        # 3D trajectory replay. We keep a bounded ~4 Hz stream from LOCAL_POSITION_NED.
+        trajectory_samples = []
+        last_trajectory_sample_ts = None
+        TRAJECTORY_SAMPLE_PERIOD_SEC = 0.25
+        MAX_TRAJECTORY_POINTS = 20000
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -1067,6 +1076,9 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
+                    "north": round(curr_north, 3) if curr_north is not None else None,
+                    "east": round(curr_east, 3) if curr_east is not None else None,
+                    "down": round(curr_down, 3) if curr_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1120,6 +1132,9 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
+                    "north": round(curr_north, 3) if curr_north is not None else None,
+                    "east": round(curr_east, 3) if curr_east is not None else None,
+                    "down": round(curr_down, 3) if curr_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1589,6 +1604,10 @@ async def analyze(file: UploadFile = File(...)):
                     y = float(y)
                     z = float(z)
 
+                    curr_north = x
+                    curr_east = y
+                    curr_down = z
+
                     d_val = math.sqrt(x * x + y * y)
 
                     if 0.0 <= d_val <= 10000.0:
@@ -1631,6 +1650,44 @@ async def analyze(file: UploadFile = File(...)):
                             0.0,
                             ned_alt,
                         )
+
+                        # Bounded 3D replay data. Keep every 0.25 s (~4 Hz).
+                        # This is independent of the 1 Hz Timeline snapshots.
+                        if (
+                            len(trajectory_samples) < MAX_TRAJECTORY_POINTS
+                            and (
+                                last_trajectory_sample_ts is None
+                                or current_timestamp - last_trajectory_sample_ts >= TRAJECTORY_SAMPLE_PERIOD_SEC
+                            )
+                        ):
+                            trajectory_samples.append({
+                                "timestamp": current_timestamp,
+                                "north": round(x, 3),
+                                "east": round(y, 3),
+                                "down": round(z, 3),
+                                "height": round(max(0.0, ned_alt), 3),
+                                "mode": current_mode,
+                                "heading": round(curr_azimuth, 1) if curr_azimuth is not None else None,
+                                "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
+                                "distance": round(curr_dist, 2),
+                                "volt": round(curr_voltage, 2) if curr_voltage > 0 else None,
+                                "curr": round(curr_amp, 1) if curr_amp >= 0 else None,
+                                "rssi": curr_rssi_pct if curr_rssi_pct > 0 else None,
+                                "dbm": round(curr_dbm) if curr_dbm != 0 else None,
+                                "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
+                                "attitude": attitude_snapshot(),
+                                "vibration": vibration_snapshot(),
+                                "esc": [
+                                    {
+                                        "id": i + 1,
+                                        "temp": round(esc_temp_current[i], 1) if esc_temp_current[i] is not None else None,
+                                        "rpm": int(esc_rpm_current[i]) if esc_rpm_current[i] is not None else None,
+                                        "current": round(esc_current_current[i], 1) if esc_current_current[i] is not None else None,
+                                    }
+                                    for i in range(4)
+                                ],
+                            })
+                            last_trajectory_sample_ts = current_timestamp
 
                         if global_rel_alt is None:
                             update_flight_altitude(
@@ -2634,6 +2691,9 @@ async def analyze(file: UploadFile = File(...)):
                     "dist": ev["dist"],
                     "azimuth": ev.get("azimuth"),
                     "positionAzimuth": ev.get("positionAzimuth"),
+                    "north": ev.get("north"),
+                    "east": ev.get("east"),
+                    "down": ev.get("down"),
                     "antennaSector": ev.get("antennaSector"),
                     "vtxBand": ev.get("vtxBand"),
                     "vtxChannel": ev.get("vtxChannel"),
@@ -3450,6 +3510,106 @@ async def analyze(file: UploadFile = File(...)):
         else:
             ai_verdict = "📊 ПОВНИЙ АНАЛІЗ ПОЛЬОТУ:"
 
+        # ------------------------------------------------------------
+        # 3D flight replay payload
+        # ------------------------------------------------------------
+        replay_base_t = first_flight_arm_timestamp or arm_timestamp or first_timestamp or 0.0
+
+        def rel_replay_time(ts):
+            if ts is None:
+                return None
+            return round(float(ts) - float(replay_base_t), 3)
+
+        replay_points = []
+        antenna_center = antenna_analysis.get("center")
+        antenna_min = antenna_analysis.get("sectorMin")
+        antenna_max = antenna_analysis.get("sectorMax")
+
+        def angle_delta_deg(a, b):
+            if not valid_number(a) or not valid_number(b):
+                return None
+            return ((float(a) - float(b) + 180.0) % 360.0) - 180.0
+
+        for p in trajectory_samples:
+            pa = p.get("positionAzimuth")
+            deviation = angle_delta_deg(pa, antenna_center)
+            inside = None
+            outside_by = None
+            if valid_number(deviation) and valid_number(antenna_analysis.get("beamWidth")):
+                half = float(antenna_analysis.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG)) / 2.0
+                inside = abs(deviation) <= half
+                outside_by = max(0.0, abs(deviation) - half)
+
+            point = dict(p)
+            point["timeSec"] = rel_replay_time(p.get("timestamp"))
+            point["insideAntennaSector"] = inside
+            point["antennaDeviation"] = round(deviation, 2) if deviation is not None else None
+            point["outsideSectorBy"] = round(outside_by, 2) if outside_by is not None else None
+            replay_points.append(point)
+
+        replay_events = []
+
+        # Mode transitions from the replay itself.
+        prev_mode = None
+        for p in replay_points:
+            mode = p.get("mode") or "Невідомо"
+            if mode != prev_mode:
+                replay_events.append({
+                    "type": "MODE",
+                    "label": f"Перехід у {mode}",
+                    "mode": mode,
+                    "timeSec": p.get("timeSec"),
+                    "north": p.get("north"),
+                    "east": p.get("east"),
+                    "height": p.get("height"),
+                })
+                prev_mode = mode
+
+        # First/false NED coordinate event.
+        if primary_false_ned_timestamp is not None:
+            nearest = None
+            if replay_points:
+                target_t = rel_replay_time(primary_false_ned_timestamp)
+                nearest = min(
+                    replay_points,
+                    key=lambda p: abs(float(p.get("timeSec") or 0.0) - float(target_t or 0.0))
+                )
+            replay_events.append({
+                "type": "NED_ZERO",
+                "label": "Перші / хибні NED координати",
+                "timeSec": rel_replay_time(primary_false_ned_timestamp),
+                "north": nearest.get("north") if nearest else None,
+                "east": nearest.get("east") if nearest else None,
+                "height": nearest.get("height") if nearest else None,
+                "coords": list(primary_false_ned_coords) if primary_false_ned_coords is not None else None,
+            })
+
+        # Critical Timeline events mapped to nearest replay coordinate.
+        critical_types = {
+            "POTENTIAL_THRUST_LOSS",
+            "RPM_DIAGONAL_CRITICAL",
+            "LAND_DESCENT_ABNORMAL",
+            "FLIGHT_SESSION_OPEN_AT_END",
+        }
+        for ev in raw_timeline:
+            if ev.get("eventType") not in critical_types and not ev.get("isError"):
+                continue
+            target = rel_replay_time(ev.get("timestamp"))
+            nearest = None
+            if replay_points and target is not None:
+                nearest = min(
+                    replay_points,
+                    key=lambda p: abs(float(p.get("timeSec") or 0.0) - float(target))
+                )
+            replay_events.append({
+                "type": ev.get("eventType") or "CRITICAL",
+                "label": ev.get("system_text") or ev.get("analysis_text") or "Критична подія",
+                "timeSec": target,
+                "north": nearest.get("north") if nearest else None,
+                "east": nearest.get("east") if nearest else None,
+                "height": nearest.get("height") if nearest else None,
+            })
+
         return {
             "success": True,
             "ai": {
@@ -3460,6 +3620,8 @@ async def analyze(file: UploadFile = File(...)):
                 "disarmDetected": disarm_detected,
                 "opticalZeroDetected": optical_zero_detected,
                 "opticalZeroText": optical_zero_text,
+                "opticalZeroTimeSec": rel_replay_time(optical_zero_timestamp),
+                "primaryFalseNedTimeSec": rel_replay_time(primary_false_ned_timestamp),
                 "firstLoiterTimestamp": first_loiter_timestamp,
                 "primaryFalseNedDetected": primary_false_ned_detected,
                 "primaryFalseNed": (
@@ -3626,6 +3788,19 @@ async def analyze(file: UploadFile = File(...)):
                     if rc_max[8] > 0
                     else "—"
                 ),
+            },
+            "trajectory3d": {
+                "points": replay_points,
+                "events": replay_events,
+                "antenna": {
+                    "available": bool(antenna_analysis.get("available")),
+                    "center": antenna_center,
+                    "sectorMin": antenna_min,
+                    "sectorMax": antenna_max,
+                    "beamWidth": antenna_analysis.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG),
+                    "confidence": antenna_analysis.get("confidence", 0),
+                },
+                "samplePeriodSec": TRAJECTORY_SAMPLE_PERIOD_SEC,
             },
             "timeline": timeline,
         }
