@@ -1038,12 +1038,6 @@ async def analyze(file: UploadFile = File(...)):
         curr_dist = 0.0
         curr_azimuth = None  # aircraft Heading from VFR_HUD
         curr_position_azimuth = None  # geometric NED azimuth from origin to aircraft
-
-        # Current LOCAL_POSITION_NED coordinates for Timeline / 3D geometry.
-        curr_north = None
-        curr_east = None
-        curr_down = None
-
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -1363,9 +1357,6 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
-                    "north": round(curr_north, 3) if curr_north is not None else None,
-                    "east": round(curr_east, 3) if curr_east is not None else None,
-                    "down": round(curr_down, 3) if curr_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1419,9 +1410,6 @@ async def analyze(file: UploadFile = File(...)):
                     "distValue": round(curr_dist, 1) if curr_dist >= 0 else None,
                     "azimuth": round(curr_azimuth, 1) if curr_azimuth is not None else None,
                     "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
-                    "north": round(curr_north, 3) if curr_north is not None else None,
-                    "east": round(curr_east, 3) if curr_east is not None else None,
-                    "down": round(curr_down, 3) if curr_down is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1890,10 +1878,6 @@ async def analyze(file: UploadFile = File(...)):
                     x = float(x)
                     y = float(y)
                     z = float(z)
-
-                    curr_north = x
-                    curr_east = y
-                    curr_down = z
 
                     d_val = math.sqrt(x * x + y * y)
 
@@ -2940,9 +2924,6 @@ async def analyze(file: UploadFile = File(...)):
                     "dist": ev["dist"],
                     "azimuth": ev.get("azimuth"),
                     "positionAzimuth": ev.get("positionAzimuth"),
-                    "north": ev.get("north"),
-                    "east": ev.get("east"),
-                    "down": ev.get("down"),
                     "antennaSector": ev.get("antennaSector"),
                     "vtxBand": ev.get("vtxBand"),
                     "vtxChannel": ev.get("vtxChannel"),
@@ -3798,162 +3779,6 @@ async def analyze(file: UploadFile = File(...)):
         else:
             ai_verdict = "📊 ПОВНИЙ АНАЛІЗ ПОЛЬОТУ:"
 
-        # ============================================================
-        # COMPACT 3D TRAJECTORY
-        # ============================================================
-        # Reuses the existing 1 Hz Timeline snapshots. This avoids duplicating
-        # all telemetry and keeps the Apps Script response small/stable.
-        trajectory_points = []
-
-        for idx, item in enumerate(timeline):
-            if item.get("eventType") != "SNAPSHOT":
-                continue
-
-            n = item.get("north")
-            e = item.get("east")
-            d = item.get("down")
-
-            if not (valid_number(n) and valid_number(e) and valid_number(d)):
-                continue
-
-            # Geometric sector status is reliable on the map only when
-            # antenna inference itself used POSITION_NED.
-            sector = item.get("antennaSector") or {}
-            map_sector_valid = (
-                antenna_analysis.get("available", False)
-                and antenna_analysis.get("method") == "POSITION_NED"
-            )
-
-            outside = None
-            deviation = None
-            outside_by = None
-
-            if map_sector_valid:
-                deviation = sector.get("deviation")
-                if valid_number(deviation):
-                    deviation = float(deviation)
-                    outside = bool(sector.get("outside"))
-                    outside_by = max(
-                        0.0,
-                        deviation - float(antenna_analysis.get("halfAngle", ANTENNA_HALF_ANGLE_DEG))
-                    )
-
-            trajectory_points.append({
-                "timelineIndex": idx,
-                "time": item.get("time"),
-                "mode": item.get("mode"),
-                "north": round(float(n), 3),
-                "east": round(float(e), 3),
-                "down": round(float(d), 3),
-                "height": round(max(0.0, -float(d)), 3),
-                "positionAzimuth": item.get("positionAzimuth"),
-                "insideAntennaSector": (
-                    None if outside is None else not outside
-                ),
-                "antennaDeviation": (
-                    round(deviation, 1) if deviation is not None else None
-                ),
-                "outsideSectorBy": (
-                    round(outside_by, 1) if outside_by is not None else None
-                ),
-            })
-
-        def parse_rel_time_text(value):
-            if not value:
-                return None
-            m = re.match(r"^(-)?(\d+):(\d+(?:\.\d+)?)$", str(value).strip())
-            if not m:
-                return None
-            sec = int(m.group(2)) * 60.0 + float(m.group(3))
-            return -sec if m.group(1) else sec
-
-        for p in trajectory_points:
-            p["timeSec"] = parse_rel_time_text(p.get("time"))
-
-        trajectory_markers = []
-
-        # Mode changes.
-        previous_mode = None
-        for p in trajectory_points:
-            mode = p.get("mode") or "Невідомо"
-            if mode != previous_mode:
-                trajectory_markers.append({
-                    "type": "MODE",
-                    "label": f"Режим: {mode}",
-                    "mode": mode,
-                    "time": p.get("time"),
-                    "timeSec": p.get("timeSec"),
-                    "timelineIndex": p.get("timelineIndex"),
-                })
-                previous_mode = mode
-
-        def nearest_point_to_relative_time(target_sec):
-            if not trajectory_points or target_sec is None:
-                return None
-            usable = [
-                p for p in trajectory_points
-                if valid_number(p.get("timeSec"))
-            ]
-            if not usable:
-                return None
-            return min(
-                usable,
-                key=lambda p: abs(float(p["timeSec"]) - float(target_sec))
-            )
-
-        def relative_sec_from_timestamp(ts):
-            if not valid_number(ts):
-                return None
-            return round(float(ts) - float(base_t), 3)
-
-        # First false/zero NED coordinates.
-        if primary_false_ned_timestamp is not None:
-            target_sec = relative_sec_from_timestamp(primary_false_ned_timestamp)
-            q = nearest_point_to_relative_time(target_sec)
-            trajectory_markers.append({
-                "type": "NED_ZERO",
-                "label": primary_false_ned_text or "Перші / хибні NED координати",
-                "timeSec": target_sec,
-                "time": format_timeline_time(primary_false_ned_timestamp, base_t),
-                "timelineIndex": q.get("timelineIndex") if q else None,
-                "coords": (
-                    list(primary_false_ned_coords)
-                    if primary_false_ned_coords is not None else None
-                ),
-            })
-
-        # First LOITER.
-        if first_loiter_timestamp is not None:
-            target_sec = relative_sec_from_timestamp(first_loiter_timestamp)
-            q = nearest_point_to_relative_time(target_sec)
-            trajectory_markers.append({
-                "type": "FIRST_LOITER",
-                "label": "Перший перехід у LOITER",
-                "timeSec": target_sec,
-                "time": format_timeline_time(first_loiter_timestamp, base_t),
-                "timelineIndex": q.get("timelineIndex") if q else None,
-            })
-
-        trajectory_3d = {
-            "available": bool(trajectory_points),
-            "points": trajectory_points,
-            "markers": trajectory_markers,
-            "antenna": {
-                # Draw a real geometric fan only for POSITION_NED inference.
-                "available": bool(
-                    antenna_analysis.get("available", False)
-                    and antenna_analysis.get("method") == "POSITION_NED"
-                ),
-                "method": antenna_analysis.get("method"),
-                "center": antenna_analysis.get("center"),
-                "sectorMin": antenna_analysis.get("sectorMin"),
-                "sectorMax": antenna_analysis.get("sectorMax"),
-                "beamWidth": antenna_analysis.get("beamWidth", ANTENNA_BEAM_WIDTH_DEG),
-                "halfAngle": antenna_analysis.get("halfAngle", ANTENNA_HALF_ANGLE_DEG),
-                "confidence": antenna_analysis.get("confidence", 0),
-            },
-        }
-
         return {
             "success": True,
             "ai": {
@@ -4135,7 +3960,6 @@ async def analyze(file: UploadFile = File(...)):
                     else "—"
                 ),
             },
-            "trajectory3d": trajectory_3d,
             "timeline": timeline,
         }
 
