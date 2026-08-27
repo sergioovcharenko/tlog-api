@@ -1091,7 +1091,18 @@ async def analyze(file: UploadFile = File(...)):
                     "attitude": attitude_snapshot(),
                     "rpmAnalysis": rpm_analysis_snapshot(),
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
-                    "system_text": "" if is_pilot_action else text,
+                    # Raw ArduPilot STATUSTEXT stays in "system_text".
+                    # Our own calculated/synthetic events go to "analysis_text".
+                    "system_text": (
+                        text
+                        if (not is_pilot_action and event_type in ("SYSTEM", "POTENTIAL_THRUST_LOSS"))
+                        else ""
+                    ),
+                    "analysis_text": (
+                        text
+                        if (not is_pilot_action and event_type not in ("SYSTEM", "POTENTIAL_THRUST_LOSS"))
+                        else ""
+                    ),
                     "pilot_text": text if is_pilot_action else "",
                     "eventType": event_type,
                     "isError": is_error,
@@ -1201,6 +1212,7 @@ async def analyze(file: UploadFile = File(...)):
             nonlocal accel_calibration_requires_reboot
             nonlocal accel_calibration_start_ts, accel_calibration_end_ts
             nonlocal accel_calibration_events
+            nonlocal attitude_critical_active, attitude_critical_peak
 
             txt_lower = full_txt.lower()
 
@@ -1235,8 +1247,13 @@ async def analyze(file: UploadFile = File(...)):
                 "place vehicle nose down",
                 "place vehicle nose up",
                 "place vehicle on its back",
+                "place vehicle on left side",
+                "place vehicle on right side",
+                "accelerometer calibration",
+                "accel calibration",
                 "calibration successful",
                 "accels calibrated requires reboot",
+                "accel calibrated requires reboot",
             )
 
             if any(marker in txt_lower for marker in accel_markers):
@@ -1244,6 +1261,14 @@ async def analyze(file: UploadFile = File(...)):
                     accel_calibration_start_ts = timestamp
 
                 accel_calibration_active = True
+
+                # If a DISARMED ATT episode was opened just before the first
+                # calibration instruction, it belongs to the calibration context.
+                # Do not carry it forward as a flight-critical event.
+                if not is_currently_armed:
+                    attitude_critical_active = False
+                    attitude_critical_peak = None
+
                 accel_calibration_events.append({
                     "timestamp": timestamp,
                     "text": full_txt,
@@ -2522,21 +2547,50 @@ async def analyze(file: UploadFile = File(...)):
         first_flight_arm_timestamp = flight_sessions[0]["armTimestamp"] if flight_sessions else arm_timestamp
 
         # Add derived Timeline markers for accelerometer calibration.
+        # IMPORTANT: clone the nearest already-valid timeline row so every field
+        # expected by the serializer is present. This avoids HTTP 500/KeyError.
         if accel_calibration_events:
+            existing_rows = [
+                row for row in raw_timeline
+                if row.get("timestamp") is not None
+            ]
+
             for idx, cal_ev in enumerate(accel_calibration_events):
-                raw_timeline.append({
+                if existing_rows:
+                    nearest = min(
+                        existing_rows,
+                        key=lambda row: abs(
+                            float(row.get("timestamp", 0.0))
+                            - float(cal_ev["timestamp"])
+                        ),
+                    )
+                    marker = dict(nearest)
+                else:
+                    marker = {
+                        "timestamp": cal_ev["timestamp"],
+                        "mode": current_mode,
+                        "alt": "0.0 м",
+                        "dist": "0.0 м",
+                        "distValue": 0.0,
+                        "azimuth": None,
+                        "positionAzimuth": None,
+                        "vtxBand": None,
+                        "vtxChannel": None,
+                        "videoFreq": None,
+                        "volt": None,
+                        "curr": None,
+                        "rssi": None,
+                        "dbm": None,
+                        "temp": None,
+                        "esc": esc_snapshot(),
+                        "vibration": vibration_snapshot(),
+                        "attitude": attitude_snapshot(),
+                        "rpmAnalysis": rpm_analysis_snapshot(),
+                        "verticalSpeedDown": None,
+                    }
+
+                marker.update({
                     "timestamp": cal_ev["timestamp"],
-                    "mode": current_mode,
-                    "alt": float(curr_alt) if valid_number(curr_alt) else 0.0,
-                    "dist": float(curr_dist) if valid_number(curr_dist) else 0.0,
-                    "volt": float(curr_voltage) if valid_number(curr_voltage) else None,
-                    "curr": float(curr_amp) if valid_number(curr_amp) else None,
-                    "dbm": curr_dbm,
-                    "esc": esc_snapshot(),
-                    "vibration": vibration_snapshot(),
-                    "attitude": attitude_snapshot(),
-                    "rpmAnalysis": rpm_analysis_snapshot(),
-                    "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "system_text": "",
                     "analysis_text": (
                         "🧭 Проводилось калібрування акселерометра"
@@ -2544,11 +2598,13 @@ async def analyze(file: UploadFile = File(...)):
                         else f"🧭 Калібрування акселерометра: {cal_ev['text']}"
                     ),
                     "pilot_text": "",
-                    "is_error": False,
+                    "isError": False,
                     "eventType": "ACCEL_CALIBRATION",
                 })
 
-            raw_timeline.sort(key=lambda e: e.get("timestamp", 0))
+                raw_timeline.append(marker)
+
+            raw_timeline.sort(key=lambda row: row.get("timestamp", 0.0))
 
         # Estimate antenna pointing from NED position azimuth + dBm.
         antenna_analysis = analyze_antenna_direction(raw_timeline, first_flight_arm_timestamp)
@@ -2579,27 +2635,28 @@ async def analyze(file: UploadFile = File(...)):
                     "azimuth": ev.get("azimuth"),
                     "positionAzimuth": ev.get("positionAzimuth"),
                     "antennaSector": ev.get("antennaSector"),
-                    "vtxBand": ev["vtxBand"],
-                    "vtxChannel": ev["vtxChannel"],
-                    "videoFreq": ev["videoFreq"],
-                    "volt": ev["volt"],
-                    "curr": ev["curr"],
-                    "rssi": ev["rssi"],
-                    "dbm": ev["dbm"],
+                    "vtxBand": ev.get("vtxBand"),
+                    "vtxChannel": ev.get("vtxChannel"),
+                    "videoFreq": ev.get("videoFreq"),
+                    "volt": ev.get("volt"),
+                    "curr": ev.get("curr"),
+                    "rssi": ev.get("rssi"),
+                    "dbm": ev.get("dbm"),
                     "radioState": ev.get("radioState"),
                     "radioStateText": ev.get("radioStateText"),
-                    "temp": ev["temp"],
-                    "esc": ev["esc"],
+                    "temp": ev.get("temp"),
+                    "esc": ev.get("esc", []),
                     "vibration": ev.get("vibration"),
                     "attitude": ev.get("attitude"),
                     "rpmAnalysis": ev.get("rpmAnalysis"),
                     "verticalSpeedDown": ev.get("verticalSpeedDown"),
                     "flightNumber": ev.get("flightNumber"),
                     "takeoffEpisodeNumber": ev.get("takeoffEpisodeNumber"),
-                    "systemText": ev["system_text"],
-                    "pilotText": ev["pilot_text"],
-                    "eventType": ev["eventType"],
-                    "isError": ev["isError"],
+                    "systemText": ev.get("system_text", ""),
+                    "analysisText": ev.get("analysis_text", ""),
+                    "pilotText": ev.get("pilot_text", ""),
+                    "eventType": ev.get("eventType", "SYSTEM"),
+                    "isError": bool(ev.get("isError", False)),
                 }
             )
 
