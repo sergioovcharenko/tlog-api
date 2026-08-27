@@ -1039,19 +1039,10 @@ async def analyze(file: UploadFile = File(...)):
         curr_azimuth = None  # aircraft Heading from VFR_HUD
         curr_position_azimuth = None  # geometric NED azimuth from origin to aircraft
 
-        # Current LOCAL_POSITION_NED coordinates.
+        # Current LOCAL_POSITION_NED coordinates for Timeline / 3D geometry.
         curr_north = None
         curr_east = None
         curr_down = None
-
-        # Lightweight 3D replay buffer.
-        # LOCAL_POSITION_NED can arrive at a high rate, therefore the visual
-        # trajectory is sampled at 2 Hz. Critical/raw analysis still uses the
-        # normal MAVLink stream and is NOT downsampled.
-        trajectory_points_raw = []
-        last_trajectory_ts = None
-        TRAJECTORY_SAMPLE_SEC = 0.5
-        TRAJECTORY_MAX_POINTS = 12000
 
         curr_voltage = 0.0
         curr_amp = 0.0
@@ -1946,52 +1937,6 @@ async def analyze(file: UploadFile = File(...)):
                             0.0,
                             ned_alt,
                         )
-
-                        # 3D visualization sample. This is deliberately isolated
-                        # from raw_timeline so it cannot change the existing
-                        # analyzer logic or event journal.
-                        if (
-                            current_timestamp > 0
-                            and len(trajectory_points_raw) < TRAJECTORY_MAX_POINTS
-                            and (
-                                last_trajectory_ts is None
-                                or current_timestamp - last_trajectory_ts >= TRAJECTORY_SAMPLE_SEC
-                            )
-                        ):
-                            trajectory_points_raw.append({
-                                "timestamp": float(current_timestamp),
-                                "north": round(x, 3),
-                                "east": round(y, 3),
-                                "down": round(z, 3),
-                                "height": round(max(0.0, ned_alt), 3),
-                                "distance": round(d_val, 2),
-                                "mode": current_mode,
-                                "heading": round(curr_azimuth, 1) if curr_azimuth is not None else None,
-                                "positionAzimuth": round(curr_position_azimuth, 1) if curr_position_azimuth is not None else None,
-                                "volt": round(curr_voltage, 2) if curr_voltage > 0 else None,
-                                "curr": round(curr_amp, 1) if curr_amp >= 0 else None,
-                                "rssi": curr_rssi_pct if curr_rssi_pct > 0 else None,
-                                "dbm": round(curr_dbm) if curr_dbm != 0 else None,
-                                "temp": round(curr_temp, 1) if curr_temp is not None else None,
-                                "verticalSpeedDown": round(curr_vertical_speed_down, 2)
-                                    if valid_number(curr_vertical_speed_down) else None,
-                                "attitude": attitude_snapshot(),
-                                "vibration": vibration_snapshot(),
-                                "rpmAnalysis": rpm_analysis_snapshot(),
-                                "esc": [
-                                    {
-                                        "id": i + 1,
-                                        "temp": round(esc_temp_current[i], 1)
-                                            if esc_temp_current[i] is not None else None,
-                                        "rpm": int(esc_rpm_current[i])
-                                            if esc_rpm_current[i] is not None else None,
-                                        "current": round(esc_current_current[i], 1)
-                                            if esc_current_current[i] is not None else None,
-                                    }
-                                    for i in range(4)
-                                ],
-                            })
-                            last_trajectory_ts = current_timestamp
 
                         if global_rel_alt is None:
                             update_flight_altitude(
@@ -3854,153 +3799,151 @@ async def analyze(file: UploadFile = File(...)):
             ai_verdict = "📊 ПОВНИЙ АНАЛІЗ ПОЛЬОТУ:"
 
         # ============================================================
-        # 3D TRAJECTORY PAYLOAD
+        # COMPACT 3D TRAJECTORY
         # ============================================================
-        # Relative time follows the exact same rule as Timeline:
-        # 00:00.000 = first ARM, pre-ARM values are negative.
-        trajectory_base_t = first_flight_arm_timestamp or arm_timestamp or first_timestamp or 0.0
-
-        def trajectory_relative_seconds(ts):
-            if not valid_number(ts):
-                return None
-            return round(float(ts) - float(trajectory_base_t), 3)
-
-        def trajectory_time_text(ts):
-            rel = trajectory_relative_seconds(ts)
-            if rel is None:
-                return None
-            sign = "-" if rel < 0 else ""
-            value = abs(rel)
-            mm = int(value // 60)
-            ss = value - mm * 60
-            return f"{sign}{mm:02d}:{ss:06.3f}"
-
+        # Reuses the existing 1 Hz Timeline snapshots. This avoids duplicating
+        # all telemetry and keeps the Apps Script response small/stable.
         trajectory_points = []
-        antenna_center = antenna_analysis.get("center")
-        antenna_half = float(antenna_analysis.get("halfAngle", ANTENNA_HALF_ANGLE_DEG))
 
-        for p in trajectory_points_raw:
-            pa = p.get("positionAzimuth")
-            deviation = heading_difference_deg(pa, antenna_center)
-            inside_sector = None
-            outside_by = None
+        for idx, item in enumerate(timeline):
+            if item.get("eventType") != "SNAPSHOT":
+                continue
 
-            if deviation is not None and antenna_analysis.get("available"):
-                inside_sector = deviation <= antenna_half
-                outside_by = max(0.0, float(deviation) - antenna_half)
+            n = item.get("north")
+            e = item.get("east")
+            d = item.get("down")
 
-            point = dict(p)
-            point["timeSec"] = trajectory_relative_seconds(p.get("timestamp"))
-            point["time"] = trajectory_time_text(p.get("timestamp"))
-            point["insideAntennaSector"] = inside_sector
-            point["antennaDeviation"] = round(deviation, 1) if deviation is not None else None
-            point["outsideSectorBy"] = round(outside_by, 1) if outside_by is not None else None
+            if not (valid_number(n) and valid_number(e) and valid_number(d)):
+                continue
 
-            # Compact critical flag for map marker/ring.
-            att = p.get("attitude") or {}
-            vib = p.get("vibration") or {}
-            rpm = p.get("rpmAnalysis") or {}
-            point["isCritical"] = bool(
-                att.get("isCritical")
-                or vib.get("isCritical")
-                or rpm.get("isCritical")
-                or (
-                    valid_number(p.get("dbm"))
-                    and float(p["dbm"]) <= RADIO_VIDEO_LOST_DBM
-                )
+            # Geometric sector status is reliable on the map only when
+            # antenna inference itself used POSITION_NED.
+            sector = item.get("antennaSector") or {}
+            map_sector_valid = (
+                antenna_analysis.get("available", False)
+                and antenna_analysis.get("method") == "POSITION_NED"
             )
 
-            trajectory_points.append(point)
+            outside = None
+            deviation = None
+            outside_by = None
 
-        # Map markers: mode changes, false/first NED coordinate event and
-        # important analyzer events. They are informational and do not alter
-        # the raw STATUSTEXT journal.
+            if map_sector_valid:
+                deviation = sector.get("deviation")
+                if valid_number(deviation):
+                    deviation = float(deviation)
+                    outside = bool(sector.get("outside"))
+                    outside_by = max(
+                        0.0,
+                        deviation - float(antenna_analysis.get("halfAngle", ANTENNA_HALF_ANGLE_DEG))
+                    )
+
+            trajectory_points.append({
+                "timelineIndex": idx,
+                "time": item.get("time"),
+                "mode": item.get("mode"),
+                "north": round(float(n), 3),
+                "east": round(float(e), 3),
+                "down": round(float(d), 3),
+                "height": round(max(0.0, -float(d)), 3),
+                "positionAzimuth": item.get("positionAzimuth"),
+                "insideAntennaSector": (
+                    None if outside is None else not outside
+                ),
+                "antennaDeviation": (
+                    round(deviation, 1) if deviation is not None else None
+                ),
+                "outsideSectorBy": (
+                    round(outside_by, 1) if outside_by is not None else None
+                ),
+            })
+
+        def parse_rel_time_text(value):
+            if not value:
+                return None
+            m = re.match(r"^(-)?(\d+):(\d+(?:\.\d+)?)$", str(value).strip())
+            if not m:
+                return None
+            sec = int(m.group(2)) * 60.0 + float(m.group(3))
+            return -sec if m.group(1) else sec
+
+        for p in trajectory_points:
+            p["timeSec"] = parse_rel_time_text(p.get("time"))
+
         trajectory_markers = []
 
-        prev_mode = None
+        # Mode changes.
+        previous_mode = None
         for p in trajectory_points:
             mode = p.get("mode") or "Невідомо"
-            if mode != prev_mode:
+            if mode != previous_mode:
                 trajectory_markers.append({
                     "type": "MODE",
                     "label": f"Режим: {mode}",
                     "mode": mode,
-                    "timeSec": p.get("timeSec"),
                     "time": p.get("time"),
-                    "north": p.get("north"),
-                    "east": p.get("east"),
-                    "height": p.get("height"),
+                    "timeSec": p.get("timeSec"),
+                    "timelineIndex": p.get("timelineIndex"),
                 })
-                prev_mode = mode
+                previous_mode = mode
 
-        def nearest_trajectory_point(ts):
-            if not trajectory_points or not valid_number(ts):
+        def nearest_point_to_relative_time(target_sec):
+            if not trajectory_points or target_sec is None:
                 return None
-            target = trajectory_relative_seconds(ts)
-            if target is None:
+            usable = [
+                p for p in trajectory_points
+                if valid_number(p.get("timeSec"))
+            ]
+            if not usable:
                 return None
             return min(
-                trajectory_points,
-                key=lambda q: abs(float(q.get("timeSec") or 0.0) - float(target))
+                usable,
+                key=lambda p: abs(float(p["timeSec"]) - float(target_sec))
             )
 
+        def relative_sec_from_timestamp(ts):
+            if not valid_number(ts):
+                return None
+            return round(float(ts) - float(base_t), 3)
+
+        # First false/zero NED coordinates.
         if primary_false_ned_timestamp is not None:
-            q = nearest_trajectory_point(primary_false_ned_timestamp)
+            target_sec = relative_sec_from_timestamp(primary_false_ned_timestamp)
+            q = nearest_point_to_relative_time(target_sec)
             trajectory_markers.append({
                 "type": "NED_ZERO",
                 "label": primary_false_ned_text or "Перші / хибні NED координати",
-                "timeSec": trajectory_relative_seconds(primary_false_ned_timestamp),
-                "time": trajectory_time_text(primary_false_ned_timestamp),
-                "north": q.get("north") if q else None,
-                "east": q.get("east") if q else None,
-                "height": q.get("height") if q else None,
-                "coords": list(primary_false_ned_coords) if primary_false_ned_coords is not None else None,
+                "timeSec": target_sec,
+                "time": format_timeline_time(primary_false_ned_timestamp, base_t),
+                "timelineIndex": q.get("timelineIndex") if q else None,
+                "coords": (
+                    list(primary_false_ned_coords)
+                    if primary_false_ned_coords is not None else None
+                ),
             })
 
+        # First LOITER.
         if first_loiter_timestamp is not None:
-            q = nearest_trajectory_point(first_loiter_timestamp)
+            target_sec = relative_sec_from_timestamp(first_loiter_timestamp)
+            q = nearest_point_to_relative_time(target_sec)
             trajectory_markers.append({
                 "type": "FIRST_LOITER",
                 "label": "Перший перехід у LOITER",
-                "timeSec": trajectory_relative_seconds(first_loiter_timestamp),
-                "time": trajectory_time_text(first_loiter_timestamp),
-                "north": q.get("north") if q else None,
-                "east": q.get("east") if q else None,
-                "height": q.get("height") if q else None,
-            })
-
-        important_event_types = {
-            "POTENTIAL_THRUST_LOSS",
-            "RPM_DIAGONAL_CRITICAL",
-            "LAND_DESCENT_ABNORMAL",
-            "FLIGHT_SESSION_OPEN_AT_END",
-        }
-
-        for ev in raw_timeline:
-            if ev.get("eventType") not in important_event_types:
-                continue
-            q = nearest_trajectory_point(ev.get("timestamp"))
-            trajectory_markers.append({
-                "type": ev.get("eventType"),
-                "label": (
-                    ev.get("system_text")
-                    or ev.get("analysis_text")
-                    or ev.get("eventType")
-                ),
-                "timeSec": trajectory_relative_seconds(ev.get("timestamp")),
-                "time": trajectory_time_text(ev.get("timestamp")),
-                "north": q.get("north") if q else None,
-                "east": q.get("east") if q else None,
-                "height": q.get("height") if q else None,
+                "timeSec": target_sec,
+                "time": format_timeline_time(first_loiter_timestamp, base_t),
+                "timelineIndex": q.get("timelineIndex") if q else None,
             })
 
         trajectory_3d = {
             "available": bool(trajectory_points),
-            "samplePeriodSec": TRAJECTORY_SAMPLE_SEC,
             "points": trajectory_points,
             "markers": trajectory_markers,
             "antenna": {
-                "available": antenna_analysis.get("available", False),
+                # Draw a real geometric fan only for POSITION_NED inference.
+                "available": bool(
+                    antenna_analysis.get("available", False)
+                    and antenna_analysis.get("method") == "POSITION_NED"
+                ),
                 "method": antenna_analysis.get("method"),
                 "center": antenna_analysis.get("center"),
                 "sectorMin": antenna_analysis.get("sectorMin"),
