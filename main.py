@@ -167,16 +167,19 @@ def circular_weighted_mean(samples):
 
 
 
+
 def estimate_map_antenna_direction(raw_timeline, flight_number):
     """
-    Оцінка осі АС саме для 2D-карти, окремо по кожному ARM->DISARM польоту.
+    V9 — гібридна оцінка осі/сектора АС для 2D-карти.
 
-    Priority:
-      1) LOCAL_POSITION_NED + dBm
-      2) DR_POSITION_ESTIMATE = groundspeed + Heading + dt
-      3) HEADING_FALLBACK тільки як крайній варіант
+    Джерела позиції за пріоритетом:
+      1. POSITION_NED
+      2. GS_DR_POSITION = groundspeed + heading + dt
+      3. ATTITUDE_DR_POSITION = roll/pitch/yaw + приблизна модель швидкості + dt
+      4. HEADING_FALLBACK — тільки діагностика, НЕ геометрія.
 
-    DR накопичує похибку, тому confidence обмежений 70%.
+    dBm використовується як радіодоказ для оцінки осі/меж сектора,
+    але НЕ використовується для "домальовування" руху.
     """
 
     result = {
@@ -186,27 +189,37 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         "center": None,
         "sectorMin": None,
         "sectorMax": None,
-        "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
-        "halfAngle": ANTENNA_HALF_ANGLE_DEG,
+        "beamWidth": None,
+        "halfAngle": None,
         "confidence": 0,
         "sampleCount": 0,
         "minDistanceUsed": None,
         "signalContrastDb": None,
         "angularCoverageDeg": None,
-
-        # V6: dynamic antenna beam estimate from signal degradation by angle.
         "beamWidthDynamic": False,
         "beamWidthReason": None,
-        "beamDropThresholdDb": 6.0,
+        "beamStrength": None,
+        "beamDropThresholdDb": None,
         "beamHalfAngleEstimated": None,
         "angularSignalProfile": [],
         "angularTrendFraction": None,
 
-        "sourceCounts": {"ned": 0, "dr": 0, "heading": 0},
+        "sourceCounts": {
+            "ned": 0,
+            "gsDr": 0,
+            "attitudeDr": 0,
+            "heading": 0,
+        },
+
+        "positionSourceQuality": None,
     }
 
     rows = [
-        ev for ev in sorted(raw_timeline, key=lambda x: x.get("timestamp", 0))
+        ev
+        for ev in sorted(
+            raw_timeline,
+            key=lambda x: x.get("timestamp", 0),
+        )
         if ev.get("eventType") == "SNAPSHOT"
         and ev.get("flightNumber") == flight_number
     ]
@@ -214,82 +227,294 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
     if len(rows) < 2:
         return result
 
-    dr_n = 0.0
-    dr_e = 0.0
+    # Approximate speed models requested for this aircraft.
+    # Used ONLY when real groundspeed is unavailable.
+    LOITER_KMH_PER_DEG = 2.75
+    LOITER_MAX_KMH = 55.0
+
+    ALTHOLD_KMH_PER_DEG = 110.0 / 30.0
+    ALTHOLD_MAX_KMH = 110.0
+
+    def mode_key(mode):
+        return (
+            str(mode or "")
+            .upper()
+            .replace(" ", "")
+            .replace("_", "")
+            .replace("-", "")
+        )
+
+    def attitude_velocity(ev):
+        """
+        Estimate world-frame velocity from Roll/Pitch/Yaw.
+
+        pitch < 0 -> approximately forward
+        roll  > 0 -> approximately right
+
+        This is only a fallback and has a strict confidence cap.
+        """
+        att = ev.get("attitude")
+
+        if not isinstance(att, dict):
+            return None
+
+        roll = att.get("roll")
+        pitch = att.get("pitch")
+        yaw = att.get("yaw")
+
+        if not (
+            valid_number(roll)
+            and valid_number(pitch)
+            and valid_number(yaw)
+        ):
+            return None
+
+        mode = mode_key(ev.get("mode"))
+
+        if "LOITER" in mode:
+            k = LOITER_KMH_PER_DEG
+            max_kmh = LOITER_MAX_KMH
+        elif "ALTHOLD" in mode:
+            k = ALTHOLD_KMH_PER_DEG
+            max_kmh = ALTHOLD_MAX_KMH
+        else:
+            return None
+
+        forward_kmh = -float(pitch) * k
+        right_kmh = float(roll) * k
+
+        magnitude = math.hypot(
+            forward_kmh,
+            right_kmh,
+        )
+
+        if magnitude > max_kmh and magnitude > 0.0:
+            scale = max_kmh / magnitude
+            forward_kmh *= scale
+            right_kmh *= scale
+
+        yaw_rad = math.radians(float(yaw) % 360.0)
+
+        north_kmh = (
+            forward_kmh * math.cos(yaw_rad)
+            - right_kmh * math.sin(yaw_rad)
+        )
+
+        east_kmh = (
+            forward_kmh * math.sin(yaw_rad)
+            + right_kmh * math.cos(yaw_rad)
+        )
+
+        return (
+            north_kmh / 3.6,
+            east_kmh / 3.6,
+        )
+
+    # --------------------------------------------------------
+    # Build parallel dead-reckoning positions.
+    # GS_DR and ATTITUDE_DR are kept separate so we know
+    # exactly which fallback supported a point.
+    # --------------------------------------------------------
+    gs_n = 0.0
+    gs_e = 0.0
+
+    att_n = 0.0
+    att_e = 0.0
+
     prev_t = None
-    prev_vn = None
-    prev_ve = None
+
+    prev_gs_vn = None
+    prev_gs_ve = None
+
+    prev_att_vn = None
+    prev_att_ve = None
+
     samples = []
 
     for ev in rows:
         ts = ev.get("timestamp")
+
         if not valid_number(ts):
             continue
+
         ts = float(ts)
 
+        # -------- real groundspeed + heading --------
         heading = ev.get("azimuth")
         groundspeed = ev.get("groundspeed")
 
-        vn = None
-        ve = None
+        gs_vn = None
+        gs_ve = None
 
-        if valid_number(heading) and valid_number(groundspeed):
-            h = math.radians(float(heading) % 360.0)
-            gs = max(0.0, float(groundspeed))
-            vn = gs * math.cos(h)
-            ve = gs * math.sin(h)
+        if (
+            valid_number(heading)
+            and valid_number(groundspeed)
+        ):
+            h = math.radians(
+                float(heading) % 360.0
+            )
 
-        if prev_t is not None and vn is not None and ve is not None:
+            gs = max(
+                0.0,
+                float(groundspeed),
+            )
+
+            gs_vn = gs * math.cos(h)
+            gs_ve = gs * math.sin(h)
+
+        # -------- attitude fallback velocity --------
+        att_vel = attitude_velocity(ev)
+
+        if att_vel is not None:
+            att_vn, att_ve = att_vel
+        else:
+            att_vn = None
+            att_ve = None
+
+        if prev_t is not None:
             dt = ts - prev_t
 
             if 0.0 < dt <= 3.0:
-                if prev_vn is not None and prev_ve is not None:
-                    dr_n += 0.5 * (prev_vn + vn) * dt
-                    dr_e += 0.5 * (prev_ve + ve) * dt
-                else:
-                    dr_n += vn * dt
-                    dr_e += ve * dt
 
-        if vn is not None and ve is not None:
-            prev_vn = vn
-            prev_ve = ve
+                # Trapezoidal GS integration.
+                if gs_vn is not None and gs_ve is not None:
+                    if (
+                        prev_gs_vn is not None
+                        and prev_gs_ve is not None
+                    ):
+                        gs_n += (
+                            0.5
+                            * (prev_gs_vn + gs_vn)
+                            * dt
+                        )
+
+                        gs_e += (
+                            0.5
+                            * (prev_gs_ve + gs_ve)
+                            * dt
+                        )
+                    else:
+                        gs_n += gs_vn * dt
+                        gs_e += gs_ve * dt
+
+                # Trapezoidal attitude integration.
+                if att_vn is not None and att_ve is not None:
+                    if (
+                        prev_att_vn is not None
+                        and prev_att_ve is not None
+                    ):
+                        att_n += (
+                            0.5
+                            * (prev_att_vn + att_vn)
+                            * dt
+                        )
+
+                        att_e += (
+                            0.5
+                            * (prev_att_ve + att_ve)
+                            * dt
+                        )
+                    else:
+                        att_n += att_vn * dt
+                        att_e += att_ve * dt
+
+        if gs_vn is not None and gs_ve is not None:
+            prev_gs_vn = gs_vn
+            prev_gs_ve = gs_ve
+
+        if att_vn is not None and att_ve is not None:
+            prev_att_vn = att_vn
+            prev_att_ve = att_ve
 
         prev_t = ts
 
+        # -------- choose position source per snapshot --------
         ned_n = ev.get("nedNorth")
         ned_e = ev.get("nedEast")
-        has_ned = valid_number(ned_n) and valid_number(ned_e)
+
+        has_ned = (
+            valid_number(ned_n)
+            and valid_number(ned_e)
+        )
+
+        has_gs = (
+            gs_vn is not None
+            and gs_ve is not None
+        )
+
+        has_att = (
+            att_vn is not None
+            and att_ve is not None
+        )
 
         if has_ned:
             pos_n = float(ned_n)
             pos_e = float(ned_e)
             source = "NED"
+
+        elif has_gs:
+            pos_n = gs_n
+            pos_e = gs_e
+            source = "GS_DR"
+
+        elif has_att:
+            pos_n = att_n
+            pos_e = att_e
+            source = "ATTITUDE_DR"
+
         else:
-            pos_n = dr_n
-            pos_e = dr_e
-            source = "DR"
+            pos_n = None
+            pos_e = None
+            source = None
 
-        dist = math.hypot(pos_n, pos_e)
+        if pos_n is not None and pos_e is not None:
+            dist = math.hypot(
+                pos_n,
+                pos_e,
+            )
 
-        pos_az = None
-        if dist >= 0.5:
             pos_az = (
-                math.degrees(math.atan2(pos_e, pos_n)) + 360.0
-            ) % 360.0
+                (
+                    math.degrees(
+                        math.atan2(
+                            pos_e,
+                            pos_n,
+                        )
+                    )
+                    + 360.0
+                )
+                % 360.0
+                if dist >= 0.5
+                else None
+            )
+        else:
+            dist = None
+            pos_az = None
 
         dbm = ev.get("dbm")
-        dbm = float(dbm) if valid_number(dbm) else None
+        dbm = (
+            float(dbm)
+            if valid_number(dbm)
+            else None
+        )
 
         samples.append({
             "timestamp": ts,
             "source": source,
             "distance": dist,
             "positionAzimuth": pos_az,
-            "heading": float(heading) % 360.0 if valid_number(heading) else None,
+            "heading": (
+                float(heading) % 360.0
+                if valid_number(heading)
+                else None
+            ),
             "dbm": dbm,
         })
 
-    def geometry_candidates(source_name, min_distance):
+    def geometry_candidates(
+        source_name,
+        min_distance,
+    ):
         out = []
 
         for x in samples:
@@ -300,16 +525,31 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             dist = x["distance"]
             dbm = x["dbm"]
 
-            if az is None or dbm is None:
+            if (
+                az is None
+                or dist is None
+                or dbm is None
+            ):
                 continue
 
             if dist < min_distance:
                 continue
 
-            if dbm <= RADIO_LINK_LOST_DBM or dbm >= 0:
+            # -128 is a loss marker, not a good sample for axis scoring.
+            if (
+                dbm <= RADIO_LINK_LOST_DBM
+                or dbm >= 0
+            ):
                 continue
 
-            corrected = dbm + 20.0 * math.log10(max(dist, 1.0))
+            # Approximate distance compensation.
+            corrected = (
+                dbm
+                + 20.0
+                * math.log10(
+                    max(dist, 1.0)
+                )
+            )
 
             out.append({
                 "score": corrected,
@@ -321,38 +561,63 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
 
         return out
 
+    NED_MIN_DISTANCE_M = ANTENNA_MIN_DISTANCE_M
+    GS_DR_MIN_DISTANCE_M = 200.0
+    ATT_DR_MIN_DISTANCE_M = 200.0
+
     ned_candidates = geometry_candidates(
         "NED",
-        ANTENNA_MIN_DISTANCE_M,
+        NED_MIN_DISTANCE_M,
     )
 
-    # Near the antenna station, dBm is not useful for pointing inference.
-    DR_MIN_DISTANCE_M = 200.0
-
-    dr_candidates = geometry_candidates(
-        "DR",
-        DR_MIN_DISTANCE_M,
+    gs_candidates = geometry_candidates(
+        "GS_DR",
+        GS_DR_MIN_DISTANCE_M,
     )
 
-    result["sourceCounts"]["ned"] = len(ned_candidates)
-    result["sourceCounts"]["dr"] = len(dr_candidates)
+    att_candidates = geometry_candidates(
+        "ATTITUDE_DR",
+        ATT_DR_MIN_DISTANCE_M,
+    )
+
+    result["sourceCounts"]["ned"] = len(
+        ned_candidates
+    )
+
+    result["sourceCounts"]["gsDr"] = len(
+        gs_candidates
+    )
+
+    result["sourceCounts"]["attitudeDr"] = len(
+        att_candidates
+    )
 
     candidates = None
     method = None
-    confidence_cap = 1.0
+    confidence_cap = 0.0
     min_distance_used = None
+    position_quality = None
 
     if len(ned_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
         candidates = ned_candidates
         method = "POSITION_NED"
-        confidence_cap = 1.0
-        min_distance_used = ANTENNA_MIN_DISTANCE_M
+        confidence_cap = 1.00
+        min_distance_used = NED_MIN_DISTANCE_M
+        position_quality = "HIGH"
 
-    elif len(dr_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
-        candidates = dr_candidates
-        method = "DR_POSITION_ESTIMATE"
+    elif len(gs_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
+        candidates = gs_candidates
+        method = "GS_DR_POSITION"
         confidence_cap = 0.70
-        min_distance_used = DR_MIN_DISTANCE_M
+        min_distance_used = GS_DR_MIN_DISTANCE_M
+        position_quality = "MEDIUM"
+
+    elif len(att_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
+        candidates = att_candidates
+        method = "ATTITUDE_DR_POSITION"
+        confidence_cap = 0.45
+        min_distance_used = ATT_DR_MIN_DISTANCE_M
+        position_quality = "LOW"
 
     if candidates:
         candidates = sorted(
@@ -363,28 +628,57 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
 
         top_n = max(
             ANTENNA_MIN_RADIO_SAMPLES,
-            int(math.ceil(
-                len(candidates)
-                * ANTENNA_TOP_SIGNAL_FRACTION
-            )),
+            int(
+                math.ceil(
+                    len(candidates)
+                    * ANTENNA_TOP_SIGNAL_FRACTION
+                )
+            ),
         )
 
-        top = candidates[:min(top_n, len(candidates))]
-        min_score = min(x["score"] for x in top)
+        top = candidates[
+            :min(
+                top_n,
+                len(candidates),
+            )
+        ]
+
+        min_score = min(
+            x["score"]
+            for x in top
+        )
 
         weighted = [
             (
                 x["azimuth"],
-                max(1.0, (x["score"] - min_score) + 1.0),
+                max(
+                    1.0,
+                    (x["score"] - min_score)
+                    + 1.0,
+                ),
             )
             for x in top
         ]
 
-        reference, concentration = circular_weighted_mean(weighted)
+        reference, concentration = (
+            circular_weighted_mean(
+                weighted
+            )
+        )
 
-        top_scores = [x["score"] for x in top]
-        lower = candidates[len(candidates)//2:]
-        lower_scores = [x["score"] for x in lower]
+        top_scores = [
+            x["score"]
+            for x in top
+        ]
+
+        lower = candidates[
+            len(candidates) // 2:
+        ]
+
+        lower_scores = [
+            x["score"]
+            for x in lower
+        ]
 
         contrast = None
 
@@ -392,8 +686,12 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             contrast = max(
                 0.0,
                 float(
-                    statistics.median(top_scores)
-                    - statistics.median(lower_scores)
+                    statistics.median(
+                        top_scores
+                    )
+                    - statistics.median(
+                        lower_scores
+                    )
                 ),
             )
 
@@ -406,12 +704,16 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         ]
 
         deviations = [
-            d for d in deviations
+            d
+            for d in deviations
             if d is not None
         ]
 
         coverage = (
-            min(180.0, max(deviations) * 2.0)
+            min(
+                180.0,
+                max(deviations) * 2.0,
+            )
             if deviations
             else 0.0
         )
@@ -431,34 +733,40 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             coverage / 45.0,
         )
 
-        # ====================================================
-        # V6 — estimate the actual usable beam width from
-        # distance-corrected dBm degradation versus angle.
-        #
-        # We do NOT automatically trust ±15° anymore.
-        # ====================================================
-
-        # Angular bins in degrees from estimated antenna axis.
-        bin_edges = [0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 90, 180]
+        # ----------------------------------------------------
+        # Dynamic beam width from corrected dBm vs angle.
+        # ----------------------------------------------------
+        bin_edges = [
+            0, 5, 10, 15, 20, 25,
+            30, 40, 50, 60, 90, 180,
+        ]
 
         prof = []
 
-        for i in range(len(bin_edges) - 1):
-            lo = float(bin_edges[i])
-            hi = float(bin_edges[i + 1])
+        for i in range(
+            len(bin_edges) - 1
+        ):
+            lo = float(
+                bin_edges[i]
+            )
+
+            hi = float(
+                bin_edges[i + 1]
+            )
 
             values = []
 
             for x in candidates:
-                dev = heading_difference_deg(
-                    x["azimuth"],
-                    reference,
+                dev = (
+                    heading_difference_deg(
+                        x["azimuth"],
+                        reference,
+                    )
                 )
 
                 if dev is None:
                     continue
 
-                # Last bin includes its upper edge.
                 in_bin = (
                     lo <= dev < hi
                     if i < len(bin_edges) - 2
@@ -466,37 +774,57 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 )
 
                 if in_bin:
-                    values.append(float(x["score"]))
+                    values.append(
+                        float(x["score"])
+                    )
 
             if values:
                 prof.append({
                     "fromDeg": lo,
                     "toDeg": hi,
                     "sampleCount": len(values),
-                    "medianCorrectedDbm": float(statistics.median(values)),
-                    "meanCorrectedDbm": float(sum(values) / len(values)),
+                    "medianCorrectedDbm": float(
+                        statistics.median(
+                            values
+                        )
+                    ),
+                    "meanCorrectedDbm": float(
+                        sum(values)
+                        / len(values)
+                    ),
                 })
 
-        # Central reference should be based on near-axis samples.
-        # Prefer 0-10°, otherwise use the strongest valid angular bin.
         central_values = []
 
         for x in candidates:
-            dev = heading_difference_deg(
-                x["azimuth"],
-                reference,
+            dev = (
+                heading_difference_deg(
+                    x["azimuth"],
+                    reference,
+                )
             )
 
-            if dev is not None and dev <= 10.0:
-                central_values.append(float(x["score"]))
+            if (
+                dev is not None
+                and dev <= 10.0
+            ):
+                central_values.append(
+                    float(x["score"])
+                )
 
         if len(central_values) >= 5:
-            center_signal = float(statistics.median(central_values))
+            center_signal = float(
+                statistics.median(
+                    central_values
+                )
+            )
+
         elif prof:
             center_signal = max(
                 p["medianCorrectedDbm"]
                 for p in prof
             )
+
         else:
             center_signal = None
 
@@ -505,36 +833,47 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 p["dropDb"] = round(
                     max(
                         0.0,
-                        center_signal - p["medianCorrectedDbm"],
+                        center_signal
+                        - p["medianCorrectedDbm"],
                     ),
                     2,
                 )
             else:
                 p["dropDb"] = None
 
-        # We only trust bins with a minimum number of samples.
         valid_prof = [
-            p for p in prof
+            p
+            for p in prof
             if p["sampleCount"] >= 5
             and p["dropDb"] is not None
         ]
 
-        # How often does signal get worse (or stay nearly equal)
-        # as angular deviation increases?
         trend_checks = 0
         trend_good = 0
 
-        for i in range(1, len(valid_prof)):
-            prev_p = valid_prof[i - 1]
-            curr_p = valid_prof[i]
+        for i in range(
+            1,
+            len(valid_prof),
+        ):
+            prev_p = valid_prof[
+                i - 1
+            ]
+
+            curr_p = valid_prof[
+                i
+            ]
 
             trend_checks += 1
 
-            # Corrected dBm should generally decrease with angle.
-            # Allow 1.5 dB noise tolerance.
+            # Allow small RF noise / multipath.
             if (
-                curr_p["medianCorrectedDbm"]
-                <= prev_p["medianCorrectedDbm"] + 1.5
+                curr_p[
+                    "medianCorrectedDbm"
+                ]
+                <= prev_p[
+                    "medianCorrectedDbm"
+                ]
+                + 1.5
             ):
                 trend_good += 1
 
@@ -544,15 +883,6 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             else 0.0
         )
 
-        # ====================================================
-        # V7 — two-level boundary detection.
-        #
-        # Why:
-        # V6 required >=6 dB. If the aircraft never flew far enough
-        # outside the beam, a real boundary could exist but the log
-        # might only show 3–5 dB before the flight turned back.
-        # ====================================================
-
         STRONG_DROP_DB = 6.0
         MODERATE_DROP_DB = 3.0
 
@@ -560,42 +890,59 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         beam_reason = None
         beam_strength = None
 
-        # 1) Strong boundary.
-        for i, p in enumerate(valid_prof):
+        # Strong boundary.
+        for i, p in enumerate(
+            valid_prof
+        ):
             if p["toDeg"] <= 10.0:
                 continue
 
-            if p["dropDb"] < STRONG_DROP_DB:
+            if (
+                p["dropDb"]
+                < STRONG_DROP_DB
+            ):
                 continue
 
             next_ok = True
 
-            if i + 1 < len(valid_prof):
-                next_p = valid_prof[i + 1]
+            if (
+                i + 1
+                < len(valid_prof)
+            ):
+                next_p = valid_prof[
+                    i + 1
+                ]
+
                 next_ok = (
                     next_p["dropDb"]
-                    >= STRONG_DROP_DB - 1.0
+                    >= STRONG_DROP_DB
+                    - 1.0
                 )
 
             if next_ok:
-                # Use the beginning of the degradation bin.
-                # This avoids inventing an angle we did not actually observe.
-                estimated_half_angle = float(p["fromDeg"])
+                estimated_half_angle = float(
+                    p["fromDeg"]
+                )
+
                 beam_strength = "STRONG"
 
                 beam_reason = (
                     f"Стійке падіння ≥{STRONG_DROP_DB:.0f} dB "
-                    f"починається біля {estimated_half_angle:.1f}°"
+                    f"починається біля "
+                    f"{estimated_half_angle:.1f}°"
                 )
                 break
 
-        # 2) Moderate boundary when angular trend is very clean.
+        # Moderate boundary, only with a very clean trend.
         if estimated_half_angle is None:
-            for i, p in enumerate(valid_prof):
+            for p in valid_prof:
                 if p["toDeg"] <= 10.0:
                     continue
 
-                if p["dropDb"] < MODERATE_DROP_DB:
+                if (
+                    p["dropDb"]
+                    < MODERATE_DROP_DB
+                ):
                     continue
 
                 moderate_ok = (
@@ -607,32 +954,42 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 if not moderate_ok:
                     continue
 
-                # Again use the start of the bin, not midpoint.
-                estimated_half_angle = float(p["fromDeg"])
+                estimated_half_angle = float(
+                    p["fromDeg"]
+                )
+
                 beam_strength = "MODERATE"
 
                 beam_reason = (
                     f"Помірне падіння ≥{MODERATE_DROP_DB:.0f} dB "
-                    f"при чистому тренді {trend_fraction:.0%}; "
-                    f"межа біля {estimated_half_angle:.1f}°"
+                    f"при чистому тренді "
+                    f"{trend_fraction:.0%}; "
+                    f"межа біля "
+                    f"{estimated_half_angle:.1f}°"
                 )
                 break
 
-        # Quality gates.
         beam_dynamic = (
-            estimated_half_angle is not None
+            estimated_half_angle
+            is not None
             and len(valid_prof) >= 3
             and coverage >= 25.0
             and (
-                (beam_strength == "STRONG" and trend_fraction >= 0.60)
+                (
+                    beam_strength
+                    == "STRONG"
+                    and trend_fraction >= 0.60
+                )
                 or
-                (beam_strength == "MODERATE" and trend_fraction >= 0.80)
+                (
+                    beam_strength
+                    == "MODERATE"
+                    and trend_fraction >= 0.80
+                )
             )
         )
 
         if beam_dynamic:
-            # Keep within observed / physically sensible range.
-            # Do not expand beyond half of angular coverage.
             max_observed_half = max(
                 10.0,
                 coverage / 2.0,
@@ -647,39 +1004,54 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 ),
             )
 
-            dynamic_beam_width = estimated_half_angle * 2.0
+            dynamic_beam_width = (
+                estimated_half_angle
+                * 2.0
+            )
+
         else:
             dynamic_beam_width = None
 
             if estimated_half_angle is None:
                 beam_reason = (
-                    "Не знайдено навіть помірного стійкого падіння "
-                    "сигналу ≥3 dB зі збільшенням кута"
+                    "Не знайдено стійкої межі "
+                    "за зміною dBm"
                 )
+
             elif coverage < 25.0:
                 beam_reason = (
-                    f"Недостатнє кутове покриття: {coverage:.1f}°"
+                    f"Недостатнє кутове "
+                    f"покриття: {coverage:.1f}°"
                 )
+
             elif trend_fraction < 0.60:
                 beam_reason = (
-                    f"dBm не погіршується достатньо послідовно "
-                    f"(trend={trend_fraction:.0%})"
+                    "dBm не погіршується "
+                    "достатньо послідовно"
                 )
-            else:
-                beam_reason = "Недостатньо кутових груп із даними"
 
-        # Confidence includes strength of the width evidence.
+            else:
+                beam_reason = (
+                    "Недостатньо кутових "
+                    "груп із даними"
+                )
+
         if beam_strength == "STRONG":
             beam_evidence_factor = min(
                 1.0,
-                0.65 + 0.35 * trend_fraction,
+                0.65
+                + 0.35
+                * trend_fraction,
             )
+
         elif beam_strength == "MODERATE":
-            # Moderate detection is useful but less certain.
             beam_evidence_factor = min(
                 0.82,
-                0.50 + 0.32 * trend_fraction,
+                0.50
+                + 0.32
+                * trend_fraction,
             )
+
         else:
             beam_evidence_factor = 0.40
 
@@ -688,35 +1060,55 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             * sample_factor
             * (
                 0.45
-                + 0.20 * contrast_factor
-                + 0.15 * coverage_factor
-                + 0.20 * beam_evidence_factor
+                + 0.20
+                * contrast_factor
+                + 0.15
+                * coverage_factor
+                + 0.20
+                * beam_evidence_factor
             )
         )
 
-        confidence = int(round(
-            min(
-                confidence_cap,
-                quality * confidence_cap,
-            ) * 100.0
-        ))
+        confidence = int(
+            round(
+                min(
+                    confidence_cap,
+                    quality
+                    * confidence_cap,
+                )
+                * 100.0
+            )
+        )
 
-        # IMPORTANT:
-        # - axis can still be useful even when width is not measurable;
-        # - finite green sector is drawn only when width is supported.
+        # ATTITUDE_DR is less reliable.
+        # Require a little more confidence before drawing.
+        draw_threshold = (
+            40
+            if method
+            == "ATTITUDE_DR_POSITION"
+            else 35
+        )
+
         drawable = bool(
             beam_dynamic
-            and confidence >= 35
+            and confidence
+            >= draw_threshold
         )
 
         beam_width_result = (
-            round(dynamic_beam_width, 1)
+            round(
+                dynamic_beam_width,
+                1,
+            )
             if beam_dynamic
             else None
         )
 
         half_angle_result = (
-            round(estimated_half_angle, 1)
+            round(
+                estimated_half_angle,
+                1,
+            )
             if beam_dynamic
             else None
         )
@@ -725,12 +1117,17 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             "available": True,
             "drawable": drawable,
             "method": method,
-            "center": round(reference, 1),
-
-            # If width is unknown, do not fabricate sector bounds.
+            "center": round(
+                reference,
+                1,
+            ),
             "sectorMin": (
                 round(
-                    (reference - estimated_half_angle) % 360.0,
+                    (
+                        reference
+                        - estimated_half_angle
+                    )
+                    % 360.0,
                     1,
                 )
                 if beam_dynamic
@@ -738,13 +1135,16 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             ),
             "sectorMax": (
                 round(
-                    (reference + estimated_half_angle) % 360.0,
+                    (
+                        reference
+                        + estimated_half_angle
+                    )
+                    % 360.0,
                     1,
                 )
                 if beam_dynamic
                 else None
             ),
-
             "beamWidth": beam_width_result,
             "halfAngle": half_angle_result,
             "beamWidthDynamic": beam_dynamic,
@@ -752,115 +1152,176 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             "beamStrength": beam_strength,
             "beamDropThresholdDb": (
                 STRONG_DROP_DB
-                if beam_strength == "STRONG"
-                else MODERATE_DROP_DB
+                if beam_strength
+                == "STRONG"
+                else (
+                    MODERATE_DROP_DB
+                    if beam_strength
+                    == "MODERATE"
+                    else None
+                )
             ),
-            "beamHalfAngleEstimated": half_angle_result,
-
+            "beamHalfAngleEstimated": (
+                half_angle_result
+            ),
             "confidence": confidence,
-            "sampleCount": len(candidates),
-            "minDistanceUsed": min_distance_used,
-
+            "sampleCount": len(
+                candidates
+            ),
+            "minDistanceUsed": (
+                min_distance_used
+            ),
             "signalContrastDb": (
-                round(contrast, 1)
-                if contrast is not None
+                round(
+                    contrast,
+                    1,
+                )
+                if contrast
+                is not None
                 else None
             ),
-
-            "angularCoverageDeg": round(coverage, 1),
-            "angularTrendFraction": round(trend_fraction, 3),
-
+            "angularCoverageDeg": round(
+                coverage,
+                1,
+            ),
+            "angularTrendFraction": round(
+                trend_fraction,
+                3,
+            ),
             "angularSignalProfile": [
                 {
-                    "fromDeg": round(p["fromDeg"], 1),
-                    "toDeg": round(p["toDeg"], 1),
-                    "sampleCount": p["sampleCount"],
+                    "fromDeg": round(
+                        p["fromDeg"],
+                        1,
+                    ),
+                    "toDeg": round(
+                        p["toDeg"],
+                        1,
+                    ),
+                    "sampleCount": (
+                        p["sampleCount"]
+                    ),
                     "medianCorrectedDbm": round(
-                        p["medianCorrectedDbm"],
+                        p[
+                            "medianCorrectedDbm"
+                        ],
                         2,
                     ),
                     "dropDb": (
-                        round(p["dropDb"], 2)
-                        if p["dropDb"] is not None
+                        round(
+                            p["dropDb"],
+                            2,
+                        )
+                        if p["dropDb"]
+                        is not None
                         else None
                     ),
                 }
                 for p in prof
             ],
+            "positionSourceQuality": (
+                position_quality
+            ),
         })
 
         return result
 
-        return result
-
-    # Last fallback. Keep for diagnostics, but draw only >=25%.
+    # --------------------------------------------------------
+    # Final diagnostic fallback: Heading + dBm.
+    # Never treated as geometric position.
+    # --------------------------------------------------------
     heading_samples = []
 
     for x in samples:
         h = x["heading"]
         dbm = x["dbm"]
 
-        if h is None or dbm is None:
+        if (
+            h is None
+            or dbm is None
+        ):
             continue
 
-        if dbm < RADIO_NORMAL_DBM or dbm >= 0:
+        if (
+            dbm < RADIO_NORMAL_DBM
+            or dbm >= 0
+        ):
             continue
 
         w = max(
             1.0,
             min(
                 25.0,
-                dbm - RADIO_NORMAL_DBM + 1.0,
+                dbm
+                - RADIO_NORMAL_DBM
+                + 1.0,
             ),
         )
 
-        heading_samples.append((h, w))
+        heading_samples.append(
+            (h, w)
+        )
 
-    result["sourceCounts"]["heading"] = len(heading_samples)
+    result["sourceCounts"]["heading"] = len(
+        heading_samples
+    )
 
-    if len(heading_samples) >= ANTENNA_MIN_RADIO_SAMPLES:
-        reference, concentration = circular_weighted_mean(
-            heading_samples
+    if (
+        len(heading_samples)
+        >= ANTENNA_MIN_RADIO_SAMPLES
+    ):
+        reference, concentration = (
+            circular_weighted_mean(
+                heading_samples
+            )
         )
 
         sample_factor = min(
             1.0,
-            len(heading_samples) / 60.0,
+            len(heading_samples)
+            / 60.0,
         )
 
-        confidence = int(round(
-            min(
-                0.35,
-                concentration
-                * sample_factor
-                * 0.35,
-            ) * 100.0
-        ))
+        confidence = int(
+            round(
+                min(
+                    0.25,
+                    concentration
+                    * sample_factor
+                    * 0.25,
+                )
+                * 100.0
+            )
+        )
 
         result.update({
             "available": True,
-
-            # Heading-only is diagnostic only in V6.
-            # Do not draw a finite beam because width cannot be measured
-            # from aircraft nose direction.
             "drawable": False,
-
             "method": "HEADING_FALLBACK",
-            "center": round(reference, 1),
+            "center": round(
+                reference,
+                1,
+            ),
             "sectorMin": None,
             "sectorMax": None,
             "beamWidth": None,
             "halfAngle": None,
             "beamWidthDynamic": False,
             "beamWidthReason": (
-                "Heading показує напрямок носа БПЛА, "
-                "а не позиційний азимут від АС"
+                "Heading показує напрямок носа "
+                "БПЛА, а не позицію відносно АС"
             ),
             "confidence": confidence,
-            "sampleCount": len(heading_samples),
+            "sampleCount": len(
+                heading_samples
+            ),
+            "positionSourceQuality": (
+                "VERY_LOW"
+            ),
         })
 
     return result
+
 
 
 def analyze_antenna_direction(raw_timeline, arm_timestamp):
