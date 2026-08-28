@@ -38,6 +38,14 @@ RPM_CRITICAL_PERSIST_SEC = 0.8
 RPM_THRUST_CORRELATION_SEC = 3.0
 MECHANICAL_CORRELATION_SEC = 2.5
 
+# V14 — causal window around Potential Thrust Loss.
+THRUST_CAUSAL_PRE_SEC = 4.0
+THRUST_CAUSAL_POST_SEC = 4.0
+THRUST_ESC_CURRENT_DROP_PCT = 35.0
+THRUST_DESCENT_DELTA_MPS = 3.0
+THRUST_DESCENT_MIN_MPS = 5.0
+THRUST_VOLTAGE_DROP_V = 1.0
+
 # LAND diagnostics.
 # ArduPilot LAND_SPEED / LAND_SPEED_HIGH are stored in cm/s,
 # LAND_ALT_LOW in cm.
@@ -5310,6 +5318,436 @@ async def analyze(file: UploadFile = File(...)):
                 "недостатньо даних і для LOCAL_POSITION_NED + dBm, і для резервної оцінки Heading + dBm."
             )
 
+        # ====================================================
+        # V14 — CAUSAL CORRELATION FOR POTENTIAL THRUST LOSS
+        # ====================================================
+        #
+        # This is not a "root cause detector". It reconstructs the temporal
+        # sequence of independent telemetry signs around each ArduPilot
+        # Potential Thrust Loss message and returns an evidence strength.
+        #
+        # Evidence weights:
+        #   matching sustained RPM asymmetry     30
+        #   ESC current drop on same motor       20
+        #   critical Roll/Pitch after event      15
+        #   descent acceleration after event     15
+        #   critical vibration near event        10
+        #   voltage drop near event               5
+        #   ArduPilot STATUSTEXT                  5
+        #
+        # Max = 100. This is evidence confidence, NOT mathematical probability.
+        def _median_valid(values):
+            vals = [
+                float(v)
+                for v in values
+                if valid_number(v)
+            ]
+            return (
+                float(statistics.median(vals))
+                if vals
+                else None
+            )
+
+        def _causal_samples(t0, start_rel, end_rel):
+            lo = t0 + start_rel
+            hi = t0 + end_rel
+
+            return [
+                x
+                for x in raw_timeline
+                if (
+                    valid_number(x.get("timestamp"))
+                    and lo <= float(x["timestamp"]) <= hi
+                )
+            ]
+
+        def _esc_motor_value(sample, motor, key):
+            if motor is None or not (1 <= motor <= 4):
+                return None
+
+            esc = sample.get("esc")
+            if not isinstance(esc, list):
+                return None
+
+            for item in esc:
+                if (
+                    isinstance(item, dict)
+                    and item.get("id") == motor
+                    and valid_number(item.get(key))
+                ):
+                    return float(item[key])
+
+            return None
+
+        def _relative_time_text(dt):
+            if not valid_number(dt):
+                return "—"
+
+            dt = float(dt)
+
+            if abs(dt) < 0.05:
+                return "у момент події"
+
+            if dt < 0:
+                return f"за {abs(dt):.1f} с до"
+
+            return f"через {dt:.1f} с після"
+
+        def build_thrust_causal_analysis(thrust):
+            t0 = float(thrust["timestamp"])
+            motor = thrust.get("motor")
+
+            result = {
+                "timestamp": t0,
+                "motor": motor,
+                "score": 5,  # ArduPilot warning itself
+                "level": "LOW",
+                "features": [],
+                "sequence": [],
+                "matchingRpm": False,
+                "escCurrentDrop": False,
+                "attitudeResponse": False,
+                "descentResponse": False,
+                "vibrationResponse": False,
+                "voltageDrop": False,
+            }
+
+            result["sequence"].append({
+                "timestamp": t0,
+                "delta": 0.0,
+                "kind": "STATUSTEXT",
+                "text": (
+                    f"ArduPilot: Potential Thrust Loss ({motor})"
+                    if motor is not None
+                    else "ArduPilot: Potential Thrust Loss"
+                ),
+            })
+
+            # ------------------------------------------------
+            # 1. Sustained RPM asymmetry, same motor.
+            # Prefer startTimestamp because it tells us when the anomaly began.
+            # ------------------------------------------------
+            matching_rpm = [
+                e for e in rpm_drop_events
+                if (
+                    motor is not None
+                    and e.get("lowerMotor") == motor
+                    and abs(
+                        float(
+                            e.get(
+                                "startTimestamp",
+                                e.get("timestamp", -1e9),
+                            )
+                        )
+                        - t0
+                    ) <= THRUST_CAUSAL_PRE_SEC + THRUST_CAUSAL_POST_SEC
+                )
+            ]
+
+            if matching_rpm:
+                rpm_ev = min(
+                    matching_rpm,
+                    key=lambda e: abs(
+                        float(
+                            e.get(
+                                "startTimestamp",
+                                e.get("timestamp", t0),
+                            )
+                        )
+                        - t0
+                    ),
+                )
+
+                rpm_ts = float(
+                    rpm_ev.get(
+                        "startTimestamp",
+                        rpm_ev["timestamp"],
+                    )
+                )
+                rpm_dt = rpm_ts - t0
+
+                # Only count as causal evidence if onset is reasonably close:
+                # up to 4 s before or 3 s after the warning.
+                if -THRUST_CAUSAL_PRE_SEC <= rpm_dt <= 3.0:
+                    result["matchingRpm"] = True
+                    result["score"] += 30
+                    result["features"].append(
+                        f"RPM Motor {motor}: sustained diagonal asymmetry "
+                        f"{rpm_ev.get('differencePct', 0.0):.1f}%"
+                    )
+                    result["sequence"].append({
+                        "timestamp": rpm_ts,
+                        "delta": rpm_dt,
+                        "kind": "RPM",
+                        "text": (
+                            f"RPM anomaly M{rpm_ev.get('pair', '?')}: "
+                            f"{rpm_ev.get('differencePct', 0.0):.1f}%; "
+                            f"lower Motor {motor}"
+                        ),
+                    })
+
+            # ------------------------------------------------
+            # 2. ESC current drop on the same motor.
+            # Baseline: -4.0..-0.8 s. Event/post: -0.3..+2.0 s.
+            # ------------------------------------------------
+            if motor is not None:
+                pre = _causal_samples(t0, -4.0, -0.8)
+                around = _causal_samples(t0, -0.3, 2.0)
+
+                pre_curr = [
+                    _esc_motor_value(x, motor, "current")
+                    for x in pre
+                ]
+                post_curr_pairs = [
+                    (
+                        float(x["timestamp"]),
+                        _esc_motor_value(x, motor, "current"),
+                    )
+                    for x in around
+                ]
+                post_curr_pairs = [
+                    x for x in post_curr_pairs
+                    if valid_number(x[1])
+                ]
+
+                baseline_current = _median_valid(pre_curr)
+
+                if (
+                    baseline_current is not None
+                    and baseline_current >= 0.5
+                    and post_curr_pairs
+                ):
+                    min_ts, min_current = min(
+                        post_curr_pairs,
+                        key=lambda x: x[1],
+                    )
+
+                    drop_pct = (
+                        (baseline_current - min_current)
+                        / max(baseline_current, 0.001)
+                        * 100.0
+                    )
+
+                    if (
+                        drop_pct >= THRUST_ESC_CURRENT_DROP_PCT
+                        and min_current < baseline_current
+                    ):
+                        result["escCurrentDrop"] = True
+                        result["score"] += 20
+                        result["features"].append(
+                            f"ESC{motor} current: "
+                            f"{baseline_current:.1f} → {min_current:.1f} A "
+                            f"(-{drop_pct:.0f}%)"
+                        )
+                        result["sequence"].append({
+                            "timestamp": min_ts,
+                            "delta": min_ts - t0,
+                            "kind": "ESC_CURRENT",
+                            "text": (
+                                f"ESC{motor} current fell from baseline "
+                                f"{baseline_current:.1f} A to {min_current:.1f} A "
+                                f"(-{drop_pct:.0f}%)"
+                            ),
+                        })
+
+            # ------------------------------------------------
+            # 3. Critical attitude response after the warning.
+            # ------------------------------------------------
+            att_after = [
+                x for x in attitude_critical_events
+                if (
+                    valid_number(x.get("timestamp"))
+                    and 0.0
+                    <= float(x["timestamp"]) - t0
+                    <= 3.0
+                )
+            ]
+
+            if att_after:
+                att = min(
+                    att_after,
+                    key=lambda x: float(x["timestamp"]),
+                )
+                att_ts = float(att["timestamp"])
+                result["attitudeResponse"] = True
+                result["score"] += 15
+                result["features"].append(
+                    f"critical Roll/Pitch response to {att.get('peak', 0.0):.1f}°"
+                )
+                result["sequence"].append({
+                    "timestamp": att_ts,
+                    "delta": att_ts - t0,
+                    "kind": "ATTITUDE",
+                    "text": (
+                        f"critical attitude: Roll {att.get('roll', 0.0):.1f}°, "
+                        f"Pitch {att.get('pitch', 0.0):.1f}°, "
+                        f"peak {att.get('peak', 0.0):.1f}°"
+                    ),
+                })
+
+            # ------------------------------------------------
+            # 4. Downward-speed response.
+            # Compare pre-event baseline with max 0..+4 s.
+            # ------------------------------------------------
+            pre_vs_samples = _causal_samples(t0, -3.0, -0.5)
+            post_vs_samples = _causal_samples(t0, 0.0, 4.0)
+
+            baseline_vs = _median_valid([
+                x.get("verticalSpeedDown")
+                for x in pre_vs_samples
+            ])
+
+            post_vs_pairs = [
+                (
+                    float(x["timestamp"]),
+                    float(x["verticalSpeedDown"]),
+                )
+                for x in post_vs_samples
+                if valid_number(x.get("verticalSpeedDown"))
+            ]
+
+            if post_vs_pairs:
+                max_vs_ts, max_vs = max(
+                    post_vs_pairs,
+                    key=lambda x: x[1],
+                )
+
+                baseline_vs_num = (
+                    max(0.0, baseline_vs)
+                    if baseline_vs is not None
+                    else 0.0
+                )
+                descent_delta = max_vs - baseline_vs_num
+
+                if (
+                    max_vs >= THRUST_DESCENT_MIN_MPS
+                    and descent_delta >= THRUST_DESCENT_DELTA_MPS
+                ):
+                    result["descentResponse"] = True
+                    result["score"] += 15
+                    result["features"].append(
+                        f"vertical speed down: "
+                        f"{baseline_vs_num:.1f} → {max_vs:.1f} m/s"
+                    )
+                    result["sequence"].append({
+                        "timestamp": max_vs_ts,
+                        "delta": max_vs_ts - t0,
+                        "kind": "DESCENT",
+                        "text": (
+                            f"down speed increased from "
+                            f"{baseline_vs_num:.1f} to {max_vs:.1f} m/s"
+                        ),
+                    })
+
+            # ------------------------------------------------
+            # 5. Critical vibration near the warning.
+            # ------------------------------------------------
+            vib_near = [
+                x for x in vibration_critical_events
+                if (
+                    valid_number(x.get("timestamp"))
+                    and abs(
+                        float(x["timestamp"]) - t0
+                    ) <= MECHANICAL_CORRELATION_SEC
+                )
+            ]
+
+            if vib_near:
+                vib = min(
+                    vib_near,
+                    key=lambda x: abs(float(x["timestamp"]) - t0),
+                )
+                vib_ts = float(vib["timestamp"])
+                result["vibrationResponse"] = True
+                result["score"] += 10
+                result["features"].append(
+                    f"critical vibration peak {vib.get('peak', 0.0):.1f}"
+                )
+                result["sequence"].append({
+                    "timestamp": vib_ts,
+                    "delta": vib_ts - t0,
+                    "kind": "VIBRATION",
+                    "text": (
+                        f"critical vibration: "
+                        f"X={vib.get('x', 0.0):.1f}, "
+                        f"Y={vib.get('y', 0.0):.1f}, "
+                        f"Z={vib.get('z', 0.0):.1f}"
+                    ),
+                })
+
+            # ------------------------------------------------
+            # 6. Voltage drop near / after warning.
+            # ------------------------------------------------
+            pre_volt = _median_valid([
+                x.get("volt")
+                for x in _causal_samples(t0, -3.0, -0.5)
+            ])
+            post_volt_pairs = [
+                (
+                    float(x["timestamp"]),
+                    float(x["volt"]),
+                )
+                for x in _causal_samples(t0, 0.0, 3.0)
+                if valid_number(x.get("volt"))
+            ]
+
+            if (
+                pre_volt is not None
+                and post_volt_pairs
+            ):
+                min_v_ts, min_v = min(
+                    post_volt_pairs,
+                    key=lambda x: x[1],
+                )
+                voltage_drop = pre_volt - min_v
+
+                if voltage_drop >= THRUST_VOLTAGE_DROP_V:
+                    result["voltageDrop"] = True
+                    result["score"] += 5
+                    result["features"].append(
+                        f"voltage: {pre_volt:.2f} → {min_v:.2f} V"
+                    )
+                    result["sequence"].append({
+                        "timestamp": min_v_ts,
+                        "delta": min_v_ts - t0,
+                        "kind": "VOLTAGE",
+                        "text": (
+                            f"voltage dropped "
+                            f"{pre_volt:.2f} → {min_v:.2f} V"
+                        ),
+                    })
+
+            result["score"] = max(
+                0,
+                min(100, int(round(result["score"]))),
+            )
+
+            if result["score"] >= 75:
+                result["level"] = "VERY_HIGH"
+            elif result["score"] >= 55:
+                result["level"] = "HIGH"
+            elif result["score"] >= 35:
+                result["level"] = "MEDIUM"
+            elif result["score"] >= 20:
+                result["level"] = "LOW"
+            else:
+                result["level"] = "VERY_LOW"
+
+            result["sequence"].sort(
+                key=lambda x: x["timestamp"]
+            )
+
+            return result
+
+        thrust_causal_analyses = [
+            build_thrust_causal_analysis(x)
+            for x in (
+                []
+                if accelerometer_calibration_session
+                else potential_thrust_loss_events
+            )
+        ]
+
         # RPM / thrust diagnostics.
         if rpm_drop_events and not accelerometer_calibration_session:
             strongest_rpm = max(
@@ -5342,51 +5780,120 @@ async def analyze(file: UploadFile = File(...)):
             )
             is_critical = True
 
-        # Potential Thrust Loss is correlated with RPM, but is not sufficient alone.
-        for thrust in ([] if accelerometer_calibration_session else potential_thrust_loss_events):
-            thrust_time = format_timeline_time(thrust["timestamp"], base_t)
-            motor = thrust.get("motor")
+        # V14 — chronological multi-sensor evidence around Potential Thrust Loss.
+        for causal in thrust_causal_analyses:
+            thrust_time = format_timeline_time(
+                causal["timestamp"],
+                base_t,
+            )
+            motor = causal.get("motor")
+            score = causal.get("score", 0)
+            level = causal.get("level", "VERY_LOW")
 
-            nearby_rpm = [
-                e for e in rpm_drop_events
-                if abs(e["timestamp"] - thrust["timestamp"]) <= RPM_THRUST_CORRELATION_SEC
-            ]
-            matching_rpm = [
-                e for e in nearby_rpm
-                if motor is not None and e.get("lowerMotor") == motor
-            ]
+            level_ua = {
+                "VERY_HIGH": "ДУЖЕ ВИСОКА",
+                "HIGH": "ВИСОКА",
+                "MEDIUM": "СЕРЕДНЯ",
+                "LOW": "НИЗЬКА",
+                "VERY_LOW": "ДУЖЕ НИЗЬКА",
+            }.get(level, level)
 
-            if matching_rpm:
-                e = max(matching_rpm, key=lambda x: x.get("differencePct", 0.0))
-                ai_alerts.append(
-                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
-                    f"🚨 <b>Potential Thrust Loss ({motor}) підтверджено телеметрією RPM:</b> "
-                    f"поруч із повідомленням зафіксовано діагональну різницю "
-                    f"{e.get('differencePct', 0.0):.1f}% з нижчим RPM у Motor {motor}. "
-                    "Це підсилює ймовірність реальної втрати тяги/проблеми двигуна, ESC "
-                    "або механічного пошкодження пропелера. "
-                    "Натисніть, щоб перейти до рядка Timeline."
-                    "</span>"
+            sequence_html = []
+
+            for seq in causal.get("sequence", []):
+                seq_time = format_timeline_time(
+                    seq.get("timestamp"),
+                    base_t,
+                )
+                dt_text = _relative_time_text(
+                    seq.get("delta")
+                )
+                sequence_html.append(
+                    f"{seq_time} — {dt_text}: {seq.get('text', '')}"
+                )
+
+            sequence_text = "; ".join(sequence_html)
+
+            # Interpretation deliberately distinguishes evidence strength
+            # from a mathematically proven root cause.
+            if score >= 75:
+                headline = (
+                    f"🚨 <b>Висока узгодженість ознак реальної втрати тяги"
+                    + (
+                        f" Motor {motor}"
+                        if motor is not None
+                        else ""
+                    )
+                    + ":</b> "
+                )
+                interpretation = (
+                    "Послідовність незалежних телеметричних ознак добре узгоджується "
+                    "з реальною проблемою тяги/силового каналу. Конкретну першопричину "
+                    "(двигун, ESC, проводка, пропелер або механічне пошкодження) "
+                    "за одним TLOG встановити неможливо."
                 )
                 is_critical = True
-            elif nearby_rpm:
-                ai_alerts.append(
-                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
-                    f"⚠️ <b>Potential Thrust Loss ({motor if motor is not None else '?'}) :</b> "
-                    "повідомлення зафіксовано, однак найбільша RPM-асиметрія поруч "
-                    "припала на інший двигун/діагональ. Потрібна ручна перевірка. "
-                    "Саме повідомлення не вважається доказом відмови."
-                    "</span>"
+
+            elif score >= 55:
+                headline = (
+                    f"🚨 <b>Ймовірна реальна втрата тяги"
+                    + (
+                        f" Motor {motor}"
+                        if motor is not None
+                        else ""
+                    )
+                    + ":</b> "
                 )
+                interpretation = (
+                    "Є кілька незалежних підтверджень, але повної причинної картини "
+                    "не вистачає. Потрібна перевірка ESC, двигуна, пропелера та живлення."
+                )
+                is_critical = True
+
+            elif score >= 35:
+                headline = (
+                    f"⚠️ <b>Potential Thrust Loss"
+                    + (
+                        f" ({motor})"
+                        if motor is not None
+                        else ""
+                    )
+                    + " — частково підтверджено:</b> "
+                )
+                interpretation = (
+                    "Є окремі супутні ознаки, але їх недостатньо для висновку "
+                    "про підтверджену відмову силового каналу."
+                )
+
             else:
-                ai_alerts.append(
-                    f'<span class="ai-jump" data-jump-time="{thrust_time}">'
-                    f"⚠️ <b>Potential Thrust Loss ({motor if motor is not None else '?'}) без RPM-підтвердження:</b> "
-                    "у часовому вікні ±3 с критичної діагональної різниці RPM не виявлено. "
-                    "Подія класифікується як попередження, а не підтверджена відмова. "
-                    "Натисніть, щоб перейти до рядка Timeline."
-                    "</span>"
+                headline = (
+                    f"⚠️ <b>Potential Thrust Loss"
+                    + (
+                        f" ({motor})"
+                        if motor is not None
+                        else ""
+                    )
+                    + " без достатнього телеметричного підтвердження:</b> "
                 )
+                interpretation = (
+                    "Повідомлення ArduPilot збережено як попередження. "
+                    "Незалежних ознак недостатньо для підтвердження реальної відмови."
+                )
+
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{thrust_time}">'
+                + headline
+                + f"<b>Evidence confidence: {score}% ({level_ua}).</b> "
+                + interpretation
+                + (
+                    " <br><b>Послідовність:</b> "
+                    + sequence_text
+                    if sequence_text
+                    else ""
+                )
+                + " Натисніть, щоб перейти до Potential Thrust Loss у Timeline."
+                + "</span>"
+            )
 
         # Multi-sensor scenario for possible external mechanical influence.
         impact_candidates = []
@@ -5617,6 +6124,7 @@ async def analyze(file: UploadFile = File(...)):
                 "rpmDiagonalWarningThresholdPct": RPM_DIAGONAL_WARNING_PCT,
                 "rpmDropEventCount": len(rpm_drop_events),
                 "potentialThrustLossCount": len(potential_thrust_loss_events),
+                "thrustCausalAnalyses": thrust_causal_analyses,
                 "flightSessionCount": len(flight_sessions),
                 "accelCalibration": {
                     "detected": bool(accel_calibration_events),
