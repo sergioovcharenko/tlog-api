@@ -544,51 +544,107 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             else 0.0
         )
 
-        # Find the first sustained >= 6 dB degradation.
-        DROP_THRESHOLD_DB = 6.0
+        # ====================================================
+        # V7 — two-level boundary detection.
+        #
+        # Why:
+        # V6 required >=6 dB. If the aircraft never flew far enough
+        # outside the beam, a real boundary could exist but the log
+        # might only show 3–5 dB before the flight turned back.
+        # ====================================================
+
+        STRONG_DROP_DB = 6.0
+        MODERATE_DROP_DB = 3.0
+
         estimated_half_angle = None
         beam_reason = None
+        beam_strength = None
 
+        # 1) Strong boundary.
         for i, p in enumerate(valid_prof):
             if p["toDeg"] <= 10.0:
                 continue
 
-            if p["dropDb"] < DROP_THRESHOLD_DB:
+            if p["dropDb"] < STRONG_DROP_DB:
                 continue
 
-            # Require confirmation in the next valid bin when available.
             next_ok = True
 
             if i + 1 < len(valid_prof):
                 next_p = valid_prof[i + 1]
-                next_ok = next_p["dropDb"] >= DROP_THRESHOLD_DB - 1.0
+                next_ok = (
+                    next_p["dropDb"]
+                    >= STRONG_DROP_DB - 1.0
+                )
 
             if next_ok:
-                # The boundary is approximately where degradation begins.
-                # Use the middle of the bin instead of an abrupt edge.
-                estimated_half_angle = (
-                    p["fromDeg"] + p["toDeg"]
-                ) / 2.0
+                # Use the beginning of the degradation bin.
+                # This avoids inventing an angle we did not actually observe.
+                estimated_half_angle = float(p["fromDeg"])
+                beam_strength = "STRONG"
 
                 beam_reason = (
-                    f"Стійке падіння ≥{DROP_THRESHOLD_DB:.0f} dB "
+                    f"Стійке падіння ≥{STRONG_DROP_DB:.0f} dB "
                     f"починається біля {estimated_half_angle:.1f}°"
                 )
                 break
 
-        # Quality gates: do not invent beam width if angular evidence is weak.
+        # 2) Moderate boundary when angular trend is very clean.
+        if estimated_half_angle is None:
+            for i, p in enumerate(valid_prof):
+                if p["toDeg"] <= 10.0:
+                    continue
+
+                if p["dropDb"] < MODERATE_DROP_DB:
+                    continue
+
+                moderate_ok = (
+                    trend_fraction >= 0.80
+                    and coverage >= 25.0
+                    and len(valid_prof) >= 3
+                )
+
+                if not moderate_ok:
+                    continue
+
+                # Again use the start of the bin, not midpoint.
+                estimated_half_angle = float(p["fromDeg"])
+                beam_strength = "MODERATE"
+
+                beam_reason = (
+                    f"Помірне падіння ≥{MODERATE_DROP_DB:.0f} dB "
+                    f"при чистому тренді {trend_fraction:.0%}; "
+                    f"межа біля {estimated_half_angle:.1f}°"
+                )
+                break
+
+        # Quality gates.
         beam_dynamic = (
             estimated_half_angle is not None
             and len(valid_prof) >= 3
-            and coverage >= 30.0
-            and trend_fraction >= 0.60
+            and coverage >= 25.0
+            and (
+                (beam_strength == "STRONG" and trend_fraction >= 0.60)
+                or
+                (beam_strength == "MODERATE" and trend_fraction >= 0.80)
+            )
         )
 
         if beam_dynamic:
-            # Clamp to a physically sensible visualization range.
+            # Keep within observed / physically sensible range.
+            # Do not expand beyond half of angular coverage.
+            max_observed_half = max(
+                10.0,
+                coverage / 2.0,
+            )
+
             estimated_half_angle = max(
                 10.0,
-                min(60.0, estimated_half_angle),
+                min(
+                    60.0,
+                    estimated_half_angle,
+                    max_observed_half,
+                ),
             )
 
             dynamic_beam_width = estimated_half_angle * 2.0
@@ -597,10 +653,10 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
 
             if estimated_half_angle is None:
                 beam_reason = (
-                    "Не знайдено стійкого падіння сигналу ≥6 dB "
-                    "зі збільшенням кута"
+                    "Не знайдено навіть помірного стійкого падіння "
+                    "сигналу ≥3 dB зі збільшенням кута"
                 )
-            elif coverage < 30.0:
+            elif coverage < 25.0:
                 beam_reason = (
                     f"Недостатнє кутове покриття: {coverage:.1f}°"
                 )
@@ -612,16 +668,20 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             else:
                 beam_reason = "Недостатньо кутових груп із даними"
 
-        # Confidence now also includes whether the dBm-vs-angle
-        # relationship itself supports a directional antenna sector.
-        beam_evidence_factor = (
-            min(
+        # Confidence includes strength of the width evidence.
+        if beam_strength == "STRONG":
+            beam_evidence_factor = min(
                 1.0,
-                0.55 + 0.45 * trend_fraction,
+                0.65 + 0.35 * trend_fraction,
             )
-            if beam_dynamic
-            else 0.45
-        )
+        elif beam_strength == "MODERATE":
+            # Moderate detection is useful but less certain.
+            beam_evidence_factor = min(
+                0.82,
+                0.50 + 0.32 * trend_fraction,
+            )
+        else:
+            beam_evidence_factor = 0.40
 
         quality = (
             concentration
@@ -689,7 +749,12 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             "halfAngle": half_angle_result,
             "beamWidthDynamic": beam_dynamic,
             "beamWidthReason": beam_reason,
-            "beamDropThresholdDb": DROP_THRESHOLD_DB,
+            "beamStrength": beam_strength,
+            "beamDropThresholdDb": (
+                STRONG_DROP_DB
+                if beam_strength == "STRONG"
+                else MODERATE_DROP_DB
+            ),
             "beamHalfAngleEstimated": half_angle_result,
 
             "confidence": confidence,
