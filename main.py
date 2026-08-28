@@ -166,6 +166,374 @@ def circular_weighted_mean(samples):
     return angle, max(0.0, min(1.0, resultant))
 
 
+
+def estimate_map_antenna_direction(raw_timeline, flight_number):
+    """
+    Оцінка осі АС саме для 2D-карти, окремо по кожному ARM->DISARM польоту.
+
+    Priority:
+      1) LOCAL_POSITION_NED + dBm
+      2) DR_POSITION_ESTIMATE = groundspeed + Heading + dt
+      3) HEADING_FALLBACK тільки як крайній варіант
+
+    DR накопичує похибку, тому confidence обмежений 70%.
+    """
+
+    result = {
+        "available": False,
+        "drawable": False,
+        "method": None,
+        "center": None,
+        "sectorMin": None,
+        "sectorMax": None,
+        "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
+        "halfAngle": ANTENNA_HALF_ANGLE_DEG,
+        "confidence": 0,
+        "sampleCount": 0,
+        "minDistanceUsed": None,
+        "signalContrastDb": None,
+        "angularCoverageDeg": None,
+        "sourceCounts": {"ned": 0, "dr": 0, "heading": 0},
+    }
+
+    rows = [
+        ev for ev in sorted(raw_timeline, key=lambda x: x.get("timestamp", 0))
+        if ev.get("eventType") == "SNAPSHOT"
+        and ev.get("flightNumber") == flight_number
+    ]
+
+    if len(rows) < 2:
+        return result
+
+    dr_n = 0.0
+    dr_e = 0.0
+    prev_t = None
+    prev_vn = None
+    prev_ve = None
+    samples = []
+
+    for ev in rows:
+        ts = ev.get("timestamp")
+        if not valid_number(ts):
+            continue
+        ts = float(ts)
+
+        heading = ev.get("azimuth")
+        groundspeed = ev.get("groundspeed")
+
+        vn = None
+        ve = None
+
+        if valid_number(heading) and valid_number(groundspeed):
+            h = math.radians(float(heading) % 360.0)
+            gs = max(0.0, float(groundspeed))
+            vn = gs * math.cos(h)
+            ve = gs * math.sin(h)
+
+        if prev_t is not None and vn is not None and ve is not None:
+            dt = ts - prev_t
+
+            if 0.0 < dt <= 3.0:
+                if prev_vn is not None and prev_ve is not None:
+                    dr_n += 0.5 * (prev_vn + vn) * dt
+                    dr_e += 0.5 * (prev_ve + ve) * dt
+                else:
+                    dr_n += vn * dt
+                    dr_e += ve * dt
+
+        if vn is not None and ve is not None:
+            prev_vn = vn
+            prev_ve = ve
+
+        prev_t = ts
+
+        ned_n = ev.get("nedNorth")
+        ned_e = ev.get("nedEast")
+        has_ned = valid_number(ned_n) and valid_number(ned_e)
+
+        if has_ned:
+            pos_n = float(ned_n)
+            pos_e = float(ned_e)
+            source = "NED"
+        else:
+            pos_n = dr_n
+            pos_e = dr_e
+            source = "DR"
+
+        dist = math.hypot(pos_n, pos_e)
+
+        pos_az = None
+        if dist >= 0.5:
+            pos_az = (
+                math.degrees(math.atan2(pos_e, pos_n)) + 360.0
+            ) % 360.0
+
+        dbm = ev.get("dbm")
+        dbm = float(dbm) if valid_number(dbm) else None
+
+        samples.append({
+            "timestamp": ts,
+            "source": source,
+            "distance": dist,
+            "positionAzimuth": pos_az,
+            "heading": float(heading) % 360.0 if valid_number(heading) else None,
+            "dbm": dbm,
+        })
+
+    def geometry_candidates(source_name, min_distance):
+        out = []
+
+        for x in samples:
+            if x["source"] != source_name:
+                continue
+
+            az = x["positionAzimuth"]
+            dist = x["distance"]
+            dbm = x["dbm"]
+
+            if az is None or dbm is None:
+                continue
+
+            if dist < min_distance:
+                continue
+
+            if dbm <= RADIO_LINK_LOST_DBM or dbm >= 0:
+                continue
+
+            corrected = dbm + 20.0 * math.log10(max(dist, 1.0))
+
+            out.append({
+                "score": corrected,
+                "azimuth": az,
+                "dbm": dbm,
+                "distance": dist,
+                "timestamp": x["timestamp"],
+            })
+
+        return out
+
+    ned_candidates = geometry_candidates(
+        "NED",
+        ANTENNA_MIN_DISTANCE_M,
+    )
+
+    # Near the antenna station, dBm is not useful for pointing inference.
+    DR_MIN_DISTANCE_M = 200.0
+
+    dr_candidates = geometry_candidates(
+        "DR",
+        DR_MIN_DISTANCE_M,
+    )
+
+    result["sourceCounts"]["ned"] = len(ned_candidates)
+    result["sourceCounts"]["dr"] = len(dr_candidates)
+
+    candidates = None
+    method = None
+    confidence_cap = 1.0
+    min_distance_used = None
+
+    if len(ned_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
+        candidates = ned_candidates
+        method = "POSITION_NED"
+        confidence_cap = 1.0
+        min_distance_used = ANTENNA_MIN_DISTANCE_M
+
+    elif len(dr_candidates) >= ANTENNA_MIN_RADIO_SAMPLES:
+        candidates = dr_candidates
+        method = "DR_POSITION_ESTIMATE"
+        confidence_cap = 0.70
+        min_distance_used = DR_MIN_DISTANCE_M
+
+    if candidates:
+        candidates = sorted(
+            candidates,
+            key=lambda x: x["score"],
+            reverse=True,
+        )
+
+        top_n = max(
+            ANTENNA_MIN_RADIO_SAMPLES,
+            int(math.ceil(
+                len(candidates)
+                * ANTENNA_TOP_SIGNAL_FRACTION
+            )),
+        )
+
+        top = candidates[:min(top_n, len(candidates))]
+        min_score = min(x["score"] for x in top)
+
+        weighted = [
+            (
+                x["azimuth"],
+                max(1.0, (x["score"] - min_score) + 1.0),
+            )
+            for x in top
+        ]
+
+        reference, concentration = circular_weighted_mean(weighted)
+
+        top_scores = [x["score"] for x in top]
+        lower = candidates[len(candidates)//2:]
+        lower_scores = [x["score"] for x in lower]
+
+        contrast = None
+
+        if top_scores and lower_scores:
+            contrast = max(
+                0.0,
+                float(
+                    statistics.median(top_scores)
+                    - statistics.median(lower_scores)
+                ),
+            )
+
+        deviations = [
+            heading_difference_deg(
+                x["azimuth"],
+                reference,
+            )
+            for x in candidates
+        ]
+
+        deviations = [
+            d for d in deviations
+            if d is not None
+        ]
+
+        coverage = (
+            min(180.0, max(deviations) * 2.0)
+            if deviations
+            else 0.0
+        )
+
+        sample_factor = min(
+            1.0,
+            len(candidates) / 60.0,
+        )
+
+        contrast_factor = min(
+            1.0,
+            (contrast or 0.0) / 12.0,
+        )
+
+        coverage_factor = min(
+            1.0,
+            coverage / 45.0,
+        )
+
+        # Confidence reflects:
+        # - circular concentration
+        # - sample count
+        # - signal contrast
+        # - actual angular exploration
+        quality = (
+            concentration
+            * sample_factor
+            * (
+                0.55
+                + 0.25 * contrast_factor
+                + 0.20 * coverage_factor
+            )
+        )
+
+        confidence = int(round(
+            min(
+                confidence_cap,
+                quality * confidence_cap,
+            ) * 100.0
+        ))
+
+        result.update({
+            "available": True,
+            "drawable": True,
+            "method": method,
+            "center": round(reference, 1),
+            "sectorMin": round(
+                (reference - ANTENNA_HALF_ANGLE_DEG) % 360.0,
+                1,
+            ),
+            "sectorMax": round(
+                (reference + ANTENNA_HALF_ANGLE_DEG) % 360.0,
+                1,
+            ),
+            "confidence": confidence,
+            "sampleCount": len(candidates),
+            "minDistanceUsed": min_distance_used,
+            "signalContrastDb": (
+                round(contrast, 1)
+                if contrast is not None
+                else None
+            ),
+            "angularCoverageDeg": round(coverage, 1),
+        })
+
+        return result
+
+    # Last fallback. Keep for diagnostics, but draw only >=25%.
+    heading_samples = []
+
+    for x in samples:
+        h = x["heading"]
+        dbm = x["dbm"]
+
+        if h is None or dbm is None:
+            continue
+
+        if dbm < RADIO_NORMAL_DBM or dbm >= 0:
+            continue
+
+        w = max(
+            1.0,
+            min(
+                25.0,
+                dbm - RADIO_NORMAL_DBM + 1.0,
+            ),
+        )
+
+        heading_samples.append((h, w))
+
+    result["sourceCounts"]["heading"] = len(heading_samples)
+
+    if len(heading_samples) >= ANTENNA_MIN_RADIO_SAMPLES:
+        reference, concentration = circular_weighted_mean(
+            heading_samples
+        )
+
+        sample_factor = min(
+            1.0,
+            len(heading_samples) / 60.0,
+        )
+
+        confidence = int(round(
+            min(
+                0.35,
+                concentration
+                * sample_factor
+                * 0.35,
+            ) * 100.0
+        ))
+
+        result.update({
+            "available": True,
+            "drawable": confidence >= 25,
+            "method": "HEADING_FALLBACK",
+            "center": round(reference, 1),
+            "sectorMin": round(
+                (reference - ANTENNA_HALF_ANGLE_DEG) % 360.0,
+                1,
+            ),
+            "sectorMax": round(
+                (reference + ANTENNA_HALF_ANGLE_DEG) % 360.0,
+                1,
+            ),
+            "confidence": confidence,
+            "sampleCount": len(heading_samples),
+        })
+
+    return result
+
+
 def analyze_antenna_direction(raw_timeline, arm_timestamp):
     """
     Оцінка напрямку АС та втрати зв'язку.
@@ -2921,6 +3289,23 @@ async def analyze(file: UploadFile = File(...)):
         # Estimate antenna pointing from NED position azimuth + dBm.
         antenna_analysis = analyze_antenna_direction(raw_timeline, first_flight_arm_timestamp)
 
+        # Per-flight antenna estimate specifically for 2D map.
+        antenna_map_analysis_by_flight = {}
+
+        flight_numbers_for_map = sorted({
+            int(ev.get("flightNumber"))
+            for ev in raw_timeline
+            if ev.get("flightNumber") is not None
+        })
+
+        for flight_no in flight_numbers_for_map:
+            antenna_map_analysis_by_flight[str(flight_no)] = (
+                estimate_map_antenna_direction(
+                    raw_timeline,
+                    flight_no,
+                )
+            )
+
         # Timeline
         # 00:00.000 = момент ARM.
         # Події до ARM показуються з мінусом, наприклад -00:32.983.
@@ -3830,6 +4215,7 @@ async def analyze(file: UploadFile = File(...)):
                 "loiterPositionFailCount": loiter_position_fail_count,
                 "externalNavRecoveryCount": external_nav_recovery_count,
                 "smartRtlBadPositionCount": smart_rtl_bad_position_count,
+                "antennaMapAnalysisByFlight": antenna_map_analysis_by_flight,
                 "antennaAnalysis": {
                     "available": antenna_analysis.get("available", False),
                     "method": antenna_analysis.get("method"),
