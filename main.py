@@ -170,7 +170,7 @@ def circular_weighted_mean(samples):
 
 def estimate_map_antenna_direction(raw_timeline, flight_number):
     """
-    V9 — гібридна оцінка осі/сектора АС для 2D-карти.
+    V12 — гібридна геометрія + 360° радіооцінка осі АС для 2D-карти.
 
     Джерела позиції за пріоритетом:
       1. POSITION_NED
@@ -212,6 +212,22 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         },
 
         "positionSourceQuality": None,
+
+        # V12 axis-search diagnostics.
+        "axisInitial": None,
+        "axisOptimized": None,
+        "axisShiftDeg": None,
+        "axisScore": None,
+        "axisSecond": None,
+        "axisSecondScore": None,
+        "axisScoreGap": None,
+        "axisStability": None,
+        "axisUncertaintyDeg": None,
+        "axisOptimizationUsed": False,
+        "axisInsideMedianDbm": None,
+        "axisOutsideMedianDbm": None,
+        "axisInsideCount": 0,
+        "axisOutsideCount": 0,
     }
 
     rows = [
@@ -666,6 +682,351 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             )
         )
 
+        # ====================================================
+        # V12 — 360° SEARCH FOR THE MOST PLAUSIBLE ANTENNA AXIS
+        # ====================================================
+        # Physical antenna sector is fixed: 30° total = ±15°.
+        # dBm does NOT move coordinates and does NOT change beam width.
+        # It only scores which possible antenna axis best explains
+        # the reconstructed NED / GS_DR / ATTITUDE_DR geometry.
+        axis_initial = reference
+
+        def _median(vals):
+            vals = [float(v) for v in vals if valid_number(v)]
+            return float(statistics.median(vals)) if vals else None
+
+        def _signed_angle_delta_deg(angle, center):
+            return (
+                (float(angle) - float(center) + 180.0)
+                % 360.0
+                - 180.0
+            )
+
+        def _axis_score(axis_deg):
+            inside = []
+            outside_near = []
+            outside_all = []
+            inside_raw = []
+            outside_raw = []
+
+            left_inside = 0
+            right_inside = 0
+
+            trend_bins = [
+                (0.0, 5.0),
+                (5.0, 10.0),
+                (10.0, 15.0),
+                (15.0, 25.0),
+                (25.0, 40.0),
+                (40.0, 60.0),
+                (60.0, 90.0),
+            ]
+            binned = [[] for _ in trend_bins]
+
+            for x in candidates:
+                az = x.get("azimuth")
+                corrected = x.get("score")
+                raw_dbm = x.get("dbm")
+
+                if (
+                    not valid_number(az)
+                    or not valid_number(corrected)
+                ):
+                    continue
+
+                signed = _signed_angle_delta_deg(
+                    az,
+                    axis_deg,
+                )
+                dev = abs(signed)
+                corrected = float(corrected)
+
+                if dev <= ANTENNA_HALF_ANGLE_DEG:
+                    inside.append(corrected)
+
+                    if valid_number(raw_dbm):
+                        inside_raw.append(float(raw_dbm))
+
+                    if signed < 0:
+                        left_inside += 1
+                    else:
+                        right_inside += 1
+
+                else:
+                    outside_all.append(corrected)
+
+                    if valid_number(raw_dbm):
+                        outside_raw.append(float(raw_dbm))
+
+                    if dev <= 60.0:
+                        outside_near.append(corrected)
+
+                for bi, (lo, hi) in enumerate(trend_bins):
+                    in_bin = (
+                        lo <= dev < hi
+                        if bi < len(trend_bins) - 1
+                        else lo <= dev <= hi
+                    )
+
+                    if in_bin:
+                        binned[bi].append(corrected)
+                        break
+
+            min_group = max(
+                8,
+                int(round(len(candidates) * 0.02)),
+            )
+
+            outside_cmp = (
+                outside_near
+                if len(outside_near) >= min_group
+                else outside_all
+            )
+
+            if (
+                len(inside) < min_group
+                or len(outside_cmp) < min_group
+            ):
+                return None
+
+            inside_med = _median(inside)
+            outside_med = _median(outside_cmp)
+
+            if (
+                inside_med is None
+                or outside_med is None
+            ):
+                return None
+
+            # Positive means corrected signal is stronger inside ±15°.
+            contrast_db = inside_med - outside_med
+
+            inside_weak_fraction = (
+                sum(
+                    1
+                    for v in inside_raw
+                    if v <= RADIO_VIDEO_LOST_DBM
+                )
+                / len(inside_raw)
+                if inside_raw
+                else 0.0
+            )
+
+            outside_strong_fraction = (
+                sum(
+                    1
+                    for v in outside_raw
+                    if v >= RADIO_NORMAL_DBM
+                )
+                / len(outside_raw)
+                if outside_raw
+                else 0.0
+            )
+
+            med_bins = []
+
+            for (lo, hi), vals in zip(
+                trend_bins,
+                binned,
+            ):
+                if len(vals) >= 5:
+                    med_bins.append(
+                        (
+                            lo,
+                            hi,
+                            _median(vals),
+                            len(vals),
+                        )
+                    )
+
+            trend_checks = 0
+            trend_good = 0
+
+            for i in range(1, len(med_bins)):
+                prev_med = med_bins[i - 1][2]
+                curr_med = med_bins[i][2]
+
+                if prev_med is None or curr_med is None:
+                    continue
+
+                trend_checks += 1
+
+                # Allow +1.5 dB RF noise / multipath.
+                if curr_med <= prev_med + 1.5:
+                    trend_good += 1
+
+            trend_fraction_local = (
+                trend_good / trend_checks
+                if trend_checks
+                else 0.0
+            )
+
+            side_total = left_inside + right_inside
+
+            side_balance = (
+                2.0
+                * min(left_inside, right_inside)
+                / side_total
+                if side_total > 0
+                else 0.0
+            )
+
+            sample_balance = min(
+                1.0,
+                min(
+                    len(inside),
+                    len(outside_cmp),
+                )
+                / max(
+                    20.0,
+                    len(candidates) * 0.08,
+                ),
+            )
+
+            score = (
+                2.20 * contrast_db
+                + 3.00 * trend_fraction_local
+                + 1.25 * side_balance
+                + 1.00 * sample_balance
+                - 7.00 * inside_weak_fraction
+                - 4.00 * outside_strong_fraction
+            )
+
+            return {
+                "axis": float(axis_deg) % 360.0,
+                "score": float(score),
+                "contrastDb": float(contrast_db),
+                "insideMedian": float(inside_med),
+                "outsideMedian": float(outside_med),
+                "insideCount": len(inside),
+                "outsideCount": len(outside_cmp),
+                "insideWeakFraction": float(
+                    inside_weak_fraction
+                ),
+                "outsideStrongFraction": float(
+                    outside_strong_fraction
+                ),
+                "trendFraction": float(
+                    trend_fraction_local
+                ),
+                "sideBalance": float(side_balance),
+            }
+
+        axis_trials = []
+
+        for axis_deg in range(360):
+            trial = _axis_score(axis_deg)
+
+            if trial is not None:
+                axis_trials.append(trial)
+
+        axis_best = None
+        axis_second = None
+        axis_gap = None
+        axis_uncertainty = None
+        axis_stability = "LOW"
+        axis_optimization_used = False
+
+        if axis_trials:
+            axis_trials.sort(
+                key=lambda z: z["score"],
+                reverse=True,
+            )
+
+            axis_best = axis_trials[0]
+
+            # Second distinct candidate: >=10° from the winner.
+            for trial in axis_trials[1:]:
+                if (
+                    heading_difference_deg(
+                        trial["axis"],
+                        axis_best["axis"],
+                    )
+                    >= 10.0
+                ):
+                    axis_second = trial
+                    break
+
+            if axis_second is not None:
+                axis_gap = (
+                    axis_best["score"]
+                    - axis_second["score"]
+                )
+
+            tolerance = max(
+                0.8,
+                abs(axis_best["score"]) * 0.08,
+            )
+
+            near_best_offsets = []
+
+            for trial in axis_trials:
+                if (
+                    axis_best["score"]
+                    - trial["score"]
+                    <= tolerance
+                ):
+                    d = heading_difference_deg(
+                        trial["axis"],
+                        axis_best["axis"],
+                    )
+
+                    if d is not None and d <= 35.0:
+                        near_best_offsets.append(d)
+
+            axis_uncertainty = (
+                max(near_best_offsets)
+                if near_best_offsets
+                else 0.0
+            )
+
+            sufficient_radio_separation = (
+                axis_best["contrastDb"] >= 1.5
+            )
+
+            sufficient_counts = (
+                axis_best["insideCount"] >= 8
+                and axis_best["outsideCount"] >= 8
+            )
+
+            axis_optimization_used = bool(
+                sufficient_radio_separation
+                and sufficient_counts
+            )
+
+            if axis_gap is not None:
+                if (
+                    axis_gap >= 3.0
+                    and axis_uncertainty <= 6.0
+                    and axis_best["contrastDb"] >= 4.0
+                ):
+                    axis_stability = "HIGH"
+
+                elif (
+                    axis_gap >= 1.0
+                    and axis_uncertainty <= 12.0
+                    and axis_best["contrastDb"] >= 2.0
+                ):
+                    axis_stability = "MEDIUM"
+
+                else:
+                    axis_stability = "LOW"
+
+            if axis_optimization_used:
+                reference = axis_best["axis"]
+
+        axis_shift = (
+            heading_difference_deg(
+                reference,
+                axis_initial,
+            )
+            if (
+                valid_number(reference)
+                and valid_number(axis_initial)
+            )
+            else None
+        )
+
         top_scores = [
             x["score"]
             for x in top
@@ -1069,6 +1430,51 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             )
         )
 
+        # V12 confidence keeps the source cap, but also accounts
+        # for how clearly the 360° search separates the winning axis.
+        if (
+            axis_best is not None
+            and axis_optimization_used
+        ):
+            axis_contrast_factor = min(
+                1.0,
+                max(
+                    0.0,
+                    axis_best["contrastDb"] / 10.0,
+                ),
+            )
+
+            axis_gap_factor = min(
+                1.0,
+                max(
+                    0.0,
+                    (axis_gap or 0.0) / 4.0,
+                ),
+            )
+
+            axis_uncertainty_factor = max(
+                0.0,
+                1.0
+                - min(
+                    1.0,
+                    (axis_uncertainty or 0.0)
+                    / 20.0,
+                ),
+            )
+
+            axis_quality_factor = (
+                0.45
+                + 0.30 * axis_contrast_factor
+                + 0.15 * axis_gap_factor
+                + 0.10 * axis_uncertainty_factor
+            )
+
+            quality = min(
+                1.0,
+                quality * 0.75
+                + axis_quality_factor * 0.25,
+            )
+
         confidence = int(
             round(
                 min(
@@ -1249,6 +1655,72 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             ],
             "positionSourceQuality": (
                 position_quality
+            ),
+
+            # V12 axis-search diagnostics.
+            "axisInitial": (
+                round(axis_initial, 1)
+                if valid_number(axis_initial)
+                else None
+            ),
+            "axisOptimized": (
+                round(axis_best["axis"], 1)
+                if axis_best is not None
+                else None
+            ),
+            "axisShiftDeg": (
+                round(axis_shift, 1)
+                if valid_number(axis_shift)
+                else None
+            ),
+            "axisScore": (
+                round(axis_best["score"], 2)
+                if axis_best is not None
+                else None
+            ),
+            "axisSecond": (
+                round(axis_second["axis"], 1)
+                if axis_second is not None
+                else None
+            ),
+            "axisSecondScore": (
+                round(axis_second["score"], 2)
+                if axis_second is not None
+                else None
+            ),
+            "axisScoreGap": (
+                round(axis_gap, 2)
+                if valid_number(axis_gap)
+                else None
+            ),
+            "axisStability": axis_stability,
+            "axisUncertaintyDeg": (
+                round(axis_uncertainty, 1)
+                if valid_number(axis_uncertainty)
+                else None
+            ),
+            "axisOptimizationUsed": bool(
+                axis_optimization_used
+            ),
+            "axisInsideMedianDbm": (
+                round(axis_best["insideMedian"], 2)
+                if axis_best is not None
+                else None
+            ),
+            "axisOutsideMedianDbm": (
+                round(axis_best["outsideMedian"], 2)
+                if axis_best is not None
+                else None
+            ),
+            "axisInsideCount": (
+                axis_best["insideCount"]
+                if axis_best is not None
+                else 0
+            ),
+            "axisOutsideCount": (
+                axis_best["outsideCount"]
+                if axis_best is not None
+                else 0
             ),
         })
 
