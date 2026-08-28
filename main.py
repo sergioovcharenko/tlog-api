@@ -1383,6 +1383,64 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
             "evidenceSigns": evidence_here.get("signs") if evidence_here else None,
         }
 
+    # ========================================================
+    # V8 SAFETY — HEADING_FALLBACK is NOT geometric position.
+    #
+    # Heading tells where the aircraft nose points, not where the
+    # aircraft is located relative to the antenna station.
+    # Therefore a "sector exit" based on HEADING_FALLBACK must never
+    # be presented as a confirmed geometric 5/5 exit.
+    # ========================================================
+    if result.get("method") == "HEADING_FALLBACK":
+        original_score = int(result.get("sectorEvidenceScore", 0) or 0)
+
+        # Keep the raw evidence episodes for diagnostics, but downgrade
+        # their interpretation because sign #1 is not truly geometric.
+        result["headingFallbackOriginalEvidenceScore"] = original_score
+        result["headingFallbackGeometricEvidenceValid"] = False
+
+        # Cap the effective score at 2/5.
+        # This allows "possible radio correlation" but prevents
+        # HIGH / VERY_HIGH geometric-sector conclusions.
+        capped_score = min(original_score, 2)
+
+        result["sectorEvidenceScore"] = capped_score
+
+        if capped_score >= 2:
+            result["sectorEvidenceLevel"] = "LOW"
+        elif capped_score == 1:
+            result["sectorEvidenceLevel"] = "WEAK"
+        else:
+            result["sectorEvidenceLevel"] = "NONE"
+
+        # Heading-only cannot establish a geometric sector exit.
+        result["probableSectorExitCount"] = 0
+        result["firstProbableExitTimestamp"] = None
+        result["probableBoardLossDueSector"] = False
+
+        # Do not let a Heading-only sector interpretation claim board
+        # loss due to antenna sector.
+        if result.get("probableBoardLossDueSector"):
+            result["probableBoardLossDueSector"] = False
+
+        # Mark all evidence episodes as non-geometric diagnostics.
+        for ep in result.get("sectorEvidenceEpisodes", []):
+            ep["geometricPositionValid"] = False
+            ep["methodWarning"] = (
+                "HEADING_FALLBACK: Heading показує напрямок носа БПЛА, "
+                "а не позиційний азимут від АС до борта."
+            )
+
+        strongest = result.get("strongestSectorEvidence")
+        if isinstance(strongest, dict):
+            strongest["geometricPositionValid"] = False
+            strongest["effectiveScore"] = capped_score
+            strongest["effectiveLevel"] = result["sectorEvidenceLevel"]
+            strongest["methodWarning"] = (
+                "HEADING_FALLBACK не підтверджує геометричний вихід за сектор."
+            )
+
+
     return result
 
 
@@ -3690,6 +3748,17 @@ async def analyze(file: UploadFile = File(...)):
                 }
             )
 
+        # V8: explicit AI wording guard for Heading-only antenna inference.
+        heading_fallback_ai_note = None
+
+        if antenna_analysis.get("method") == "HEADING_FALLBACK":
+            heading_fallback_ai_note = (
+                "⚠️ <b>АС / Heading fallback:</b> напрямок АС оцінено лише за "
+                "Heading БПЛА + dBm. Це не геометричний позиційний азимут, тому "
+                "вихід за сектор не вважається підтвердженим. Дані можуть свідчити "
+                "лише про можливу радіокореляцію."
+            )
+
         # Display
         rssi_percent = (
             round((min_rssi / 254.0) * 100)
@@ -3715,6 +3784,9 @@ async def analyze(file: UploadFile = File(...)):
 
         ai_alerts = []
         is_critical = False
+
+        if heading_fallback_ai_note:
+            ai_alerts.append(heading_fallback_ai_note)
 
         # High-level context has priority over flight-only heuristics.
         ground_session = not ever_armed
