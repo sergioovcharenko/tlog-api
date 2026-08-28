@@ -1044,6 +1044,9 @@ async def analyze(file: UploadFile = File(...)):
         curr_ned_east = None
         curr_ned_down = None
 
+        # Current VFR_HUD groundspeed in m/s.
+        curr_groundspeed = None
+
         curr_voltage = 0.0
         curr_amp = 0.0
         curr_rssi_pct = 0
@@ -1366,6 +1369,7 @@ async def analyze(file: UploadFile = File(...)):
                     "nedNorth": round(curr_ned_north, 3) if curr_ned_north is not None else None,
                     "nedEast": round(curr_ned_east, 3) if curr_ned_east is not None else None,
                     "nedDown": round(curr_ned_down, 3) if curr_ned_down is not None else None,
+                    "groundspeed": round(curr_groundspeed, 3) if curr_groundspeed is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1422,6 +1426,7 @@ async def analyze(file: UploadFile = File(...)):
                     "nedNorth": round(curr_ned_north, 3) if curr_ned_north is not None else None,
                     "nedEast": round(curr_ned_east, 3) if curr_ned_east is not None else None,
                     "nedDown": round(curr_ned_down, 3) if curr_ned_down is not None else None,
+                    "groundspeed": round(curr_groundspeed, 3) if curr_groundspeed is not None else None,
                     "vtxBand": curr_vtx_band,
                     "vtxChannel": curr_vtx_channel,
                     "videoFreq": curr_video_freq,
@@ -1848,9 +1853,10 @@ async def analyze(file: UploadFile = File(...)):
                     )
 
                 if valid_number(msg.groundspeed):
+                    curr_groundspeed = max(0.0, float(msg.groundspeed))
                     max_speed = max(
                         max_speed,
-                        float(msg.groundspeed),
+                        curr_groundspeed,
                     )
 
                 if valid_number(msg.throttle):
@@ -2943,6 +2949,7 @@ async def analyze(file: UploadFile = File(...)):
                     "nedNorth": ev.get("nedNorth"),
                     "nedEast": ev.get("nedEast"),
                     "nedDown": ev.get("nedDown"),
+                    "groundspeed": ev.get("groundspeed"),
                     "antennaSector": ev.get("antennaSector"),
                     "vtxBand": ev.get("vtxBand"),
                     "vtxChannel": ev.get("vtxChannel"),
