@@ -193,6 +193,15 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         "minDistanceUsed": None,
         "signalContrastDb": None,
         "angularCoverageDeg": None,
+
+        # V6: dynamic antenna beam estimate from signal degradation by angle.
+        "beamWidthDynamic": False,
+        "beamWidthReason": None,
+        "beamDropThresholdDb": 6.0,
+        "beamHalfAngleEstimated": None,
+        "angularSignalProfile": [],
+        "angularTrendFraction": None,
+
         "sourceCounts": {"ned": 0, "dr": 0, "heading": 0},
     }
 
@@ -422,18 +431,206 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             coverage / 45.0,
         )
 
-        # Confidence reflects:
-        # - circular concentration
-        # - sample count
-        # - signal contrast
-        # - actual angular exploration
+        # ====================================================
+        # V6 — estimate the actual usable beam width from
+        # distance-corrected dBm degradation versus angle.
+        #
+        # We do NOT automatically trust ±15° anymore.
+        # ====================================================
+
+        # Angular bins in degrees from estimated antenna axis.
+        bin_edges = [0, 5, 10, 15, 20, 25, 30, 40, 50, 60, 90, 180]
+
+        prof = []
+
+        for i in range(len(bin_edges) - 1):
+            lo = float(bin_edges[i])
+            hi = float(bin_edges[i + 1])
+
+            values = []
+
+            for x in candidates:
+                dev = heading_difference_deg(
+                    x["azimuth"],
+                    reference,
+                )
+
+                if dev is None:
+                    continue
+
+                # Last bin includes its upper edge.
+                in_bin = (
+                    lo <= dev < hi
+                    if i < len(bin_edges) - 2
+                    else lo <= dev <= hi
+                )
+
+                if in_bin:
+                    values.append(float(x["score"]))
+
+            if values:
+                prof.append({
+                    "fromDeg": lo,
+                    "toDeg": hi,
+                    "sampleCount": len(values),
+                    "medianCorrectedDbm": float(statistics.median(values)),
+                    "meanCorrectedDbm": float(sum(values) / len(values)),
+                })
+
+        # Central reference should be based on near-axis samples.
+        # Prefer 0-10°, otherwise use the strongest valid angular bin.
+        central_values = []
+
+        for x in candidates:
+            dev = heading_difference_deg(
+                x["azimuth"],
+                reference,
+            )
+
+            if dev is not None and dev <= 10.0:
+                central_values.append(float(x["score"]))
+
+        if len(central_values) >= 5:
+            center_signal = float(statistics.median(central_values))
+        elif prof:
+            center_signal = max(
+                p["medianCorrectedDbm"]
+                for p in prof
+            )
+        else:
+            center_signal = None
+
+        for p in prof:
+            if center_signal is not None:
+                p["dropDb"] = round(
+                    max(
+                        0.0,
+                        center_signal - p["medianCorrectedDbm"],
+                    ),
+                    2,
+                )
+            else:
+                p["dropDb"] = None
+
+        # We only trust bins with a minimum number of samples.
+        valid_prof = [
+            p for p in prof
+            if p["sampleCount"] >= 5
+            and p["dropDb"] is not None
+        ]
+
+        # How often does signal get worse (or stay nearly equal)
+        # as angular deviation increases?
+        trend_checks = 0
+        trend_good = 0
+
+        for i in range(1, len(valid_prof)):
+            prev_p = valid_prof[i - 1]
+            curr_p = valid_prof[i]
+
+            trend_checks += 1
+
+            # Corrected dBm should generally decrease with angle.
+            # Allow 1.5 dB noise tolerance.
+            if (
+                curr_p["medianCorrectedDbm"]
+                <= prev_p["medianCorrectedDbm"] + 1.5
+            ):
+                trend_good += 1
+
+        trend_fraction = (
+            trend_good / trend_checks
+            if trend_checks > 0
+            else 0.0
+        )
+
+        # Find the first sustained >= 6 dB degradation.
+        DROP_THRESHOLD_DB = 6.0
+        estimated_half_angle = None
+        beam_reason = None
+
+        for i, p in enumerate(valid_prof):
+            if p["toDeg"] <= 10.0:
+                continue
+
+            if p["dropDb"] < DROP_THRESHOLD_DB:
+                continue
+
+            # Require confirmation in the next valid bin when available.
+            next_ok = True
+
+            if i + 1 < len(valid_prof):
+                next_p = valid_prof[i + 1]
+                next_ok = next_p["dropDb"] >= DROP_THRESHOLD_DB - 1.0
+
+            if next_ok:
+                # The boundary is approximately where degradation begins.
+                # Use the middle of the bin instead of an abrupt edge.
+                estimated_half_angle = (
+                    p["fromDeg"] + p["toDeg"]
+                ) / 2.0
+
+                beam_reason = (
+                    f"Стійке падіння ≥{DROP_THRESHOLD_DB:.0f} dB "
+                    f"починається біля {estimated_half_angle:.1f}°"
+                )
+                break
+
+        # Quality gates: do not invent beam width if angular evidence is weak.
+        beam_dynamic = (
+            estimated_half_angle is not None
+            and len(valid_prof) >= 3
+            and coverage >= 30.0
+            and trend_fraction >= 0.60
+        )
+
+        if beam_dynamic:
+            # Clamp to a physically sensible visualization range.
+            estimated_half_angle = max(
+                10.0,
+                min(60.0, estimated_half_angle),
+            )
+
+            dynamic_beam_width = estimated_half_angle * 2.0
+        else:
+            dynamic_beam_width = None
+
+            if estimated_half_angle is None:
+                beam_reason = (
+                    "Не знайдено стійкого падіння сигналу ≥6 dB "
+                    "зі збільшенням кута"
+                )
+            elif coverage < 30.0:
+                beam_reason = (
+                    f"Недостатнє кутове покриття: {coverage:.1f}°"
+                )
+            elif trend_fraction < 0.60:
+                beam_reason = (
+                    f"dBm не погіршується достатньо послідовно "
+                    f"(trend={trend_fraction:.0%})"
+                )
+            else:
+                beam_reason = "Недостатньо кутових груп із даними"
+
+        # Confidence now also includes whether the dBm-vs-angle
+        # relationship itself supports a directional antenna sector.
+        beam_evidence_factor = (
+            min(
+                1.0,
+                0.55 + 0.45 * trend_fraction,
+            )
+            if beam_dynamic
+            else 0.45
+        )
+
         quality = (
             concentration
             * sample_factor
             * (
-                0.55
-                + 0.25 * contrast_factor
-                + 0.20 * coverage_factor
+                0.45
+                + 0.20 * contrast_factor
+                + 0.15 * coverage_factor
+                + 0.20 * beam_evidence_factor
             )
         )
 
@@ -444,29 +641,90 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             ) * 100.0
         ))
 
+        # IMPORTANT:
+        # - axis can still be useful even when width is not measurable;
+        # - finite green sector is drawn only when width is supported.
+        drawable = bool(
+            beam_dynamic
+            and confidence >= 35
+        )
+
+        beam_width_result = (
+            round(dynamic_beam_width, 1)
+            if beam_dynamic
+            else None
+        )
+
+        half_angle_result = (
+            round(estimated_half_angle, 1)
+            if beam_dynamic
+            else None
+        )
+
         result.update({
             "available": True,
-            "drawable": True,
+            "drawable": drawable,
             "method": method,
             "center": round(reference, 1),
-            "sectorMin": round(
-                (reference - ANTENNA_HALF_ANGLE_DEG) % 360.0,
-                1,
+
+            # If width is unknown, do not fabricate sector bounds.
+            "sectorMin": (
+                round(
+                    (reference - estimated_half_angle) % 360.0,
+                    1,
+                )
+                if beam_dynamic
+                else None
             ),
-            "sectorMax": round(
-                (reference + ANTENNA_HALF_ANGLE_DEG) % 360.0,
-                1,
+            "sectorMax": (
+                round(
+                    (reference + estimated_half_angle) % 360.0,
+                    1,
+                )
+                if beam_dynamic
+                else None
             ),
+
+            "beamWidth": beam_width_result,
+            "halfAngle": half_angle_result,
+            "beamWidthDynamic": beam_dynamic,
+            "beamWidthReason": beam_reason,
+            "beamDropThresholdDb": DROP_THRESHOLD_DB,
+            "beamHalfAngleEstimated": half_angle_result,
+
             "confidence": confidence,
             "sampleCount": len(candidates),
             "minDistanceUsed": min_distance_used,
+
             "signalContrastDb": (
                 round(contrast, 1)
                 if contrast is not None
                 else None
             ),
+
             "angularCoverageDeg": round(coverage, 1),
+            "angularTrendFraction": round(trend_fraction, 3),
+
+            "angularSignalProfile": [
+                {
+                    "fromDeg": round(p["fromDeg"], 1),
+                    "toDeg": round(p["toDeg"], 1),
+                    "sampleCount": p["sampleCount"],
+                    "medianCorrectedDbm": round(
+                        p["medianCorrectedDbm"],
+                        2,
+                    ),
+                    "dropDb": (
+                        round(p["dropDb"], 2)
+                        if p["dropDb"] is not None
+                        else None
+                    ),
+                }
+                for p in prof
+            ],
         })
+
+        return result
 
         return result
 
@@ -516,16 +774,22 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
 
         result.update({
             "available": True,
-            "drawable": confidence >= 25,
+
+            # Heading-only is diagnostic only in V6.
+            # Do not draw a finite beam because width cannot be measured
+            # from aircraft nose direction.
+            "drawable": False,
+
             "method": "HEADING_FALLBACK",
             "center": round(reference, 1),
-            "sectorMin": round(
-                (reference - ANTENNA_HALF_ANGLE_DEG) % 360.0,
-                1,
-            ),
-            "sectorMax": round(
-                (reference + ANTENNA_HALF_ANGLE_DEG) % 360.0,
-                1,
+            "sectorMin": None,
+            "sectorMax": None,
+            "beamWidth": None,
+            "halfAngle": None,
+            "beamWidthDynamic": False,
+            "beamWidthReason": (
+                "Heading показує напрямок носа БПЛА, "
+                "а не позиційний азимут від АС"
             ),
             "confidence": confidence,
             "sampleCount": len(heading_samples),
