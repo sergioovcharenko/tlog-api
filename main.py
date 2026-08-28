@@ -1113,6 +1113,33 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             else None
         )
 
+        # V11:
+        # The physical antenna sector is known a priori:
+        # 30° total width = ±15° from the estimated antenna axis.
+        #
+        # The dBm-vs-angle analysis is kept ONLY as a diagnostic of
+        # where signal degradation starts outside/around the physical sector.
+        physical_half_angle = ANTENNA_HALF_ANGLE_DEG
+        physical_beam_width = ANTENNA_BEAM_WIDTH_DEG
+
+        # We can draw the physical sector whenever the AXIS itself has
+        # reasonable confidence. Beam width is no longer inferred from dBm.
+        axis_draw_threshold = (
+            20
+            if method == "ATTITUDE_DR_POSITION"
+            else 25
+        )
+
+        drawable = bool(
+            confidence >= axis_draw_threshold
+        )
+
+        radio_degradation_angle = (
+            round(estimated_half_angle, 1)
+            if estimated_half_angle is not None
+            else None
+        )
+
         result.update({
             "available": True,
             "drawable": drawable,
@@ -1121,49 +1148,50 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 reference,
                 1,
             ),
-            "sectorMin": (
-                round(
-                    (
-                        reference
-                        - estimated_half_angle
-                    )
-                    % 360.0,
-                    1,
+
+            # PHYSICAL SECTOR: ALWAYS 30° / ±15°.
+            "sectorMin": round(
+                (
+                    reference
+                    - physical_half_angle
                 )
-                if beam_dynamic
-                else None
+                % 360.0,
+                1,
             ),
-            "sectorMax": (
-                round(
-                    (
-                        reference
-                        + estimated_half_angle
-                    )
-                    % 360.0,
-                    1,
+            "sectorMax": round(
+                (
+                    reference
+                    + physical_half_angle
                 )
-                if beam_dynamic
-                else None
+                % 360.0,
+                1,
             ),
-            "beamWidth": beam_width_result,
-            "halfAngle": half_angle_result,
-            "beamWidthDynamic": beam_dynamic,
-            "beamWidthReason": beam_reason,
+            "beamWidth": physical_beam_width,
+            "halfAngle": physical_half_angle,
+            "beamWidthDynamic": False,
+            "beamWidthReason": (
+                "Фізична ширина АС задана: 30° (±15°). "
+                "dBm не змінює фізичний сектор."
+            ),
+
+            # Separate radio behavior outside/around the physical sector.
+            "radioDegradationAngle": radio_degradation_angle,
+            "radioDegradationReason": beam_reason,
+            "radioDegradationStrength": beam_strength,
+            "radioDegradationDetected": bool(beam_dynamic),
             "beamStrength": beam_strength,
             "beamDropThresholdDb": (
                 STRONG_DROP_DB
-                if beam_strength
-                == "STRONG"
+                if beam_strength == "STRONG"
                 else (
                     MODERATE_DROP_DB
-                    if beam_strength
-                    == "MODERATE"
+                    if beam_strength == "MODERATE"
                     else None
                 )
             ),
-            "beamHalfAngleEstimated": (
-                half_angle_result
-            ),
+
+            # Kept for backward compatibility, but this is NOT beam width.
+            "beamHalfAngleEstimated": radio_degradation_angle,
             "confidence": confidence,
             "sampleCount": len(
                 candidates
@@ -1304,13 +1332,17 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             ),
             "sectorMin": None,
             "sectorMax": None,
-            "beamWidth": None,
-            "halfAngle": None,
+            "beamWidth": ANTENNA_BEAM_WIDTH_DEG,
+            "halfAngle": ANTENNA_HALF_ANGLE_DEG,
             "beamWidthDynamic": False,
             "beamWidthReason": (
-                "Heading показує напрямок носа "
-                "БПЛА, а не позицію відносно АС"
+                "Фізична ширина АС відома: 30° (±15°), "
+                "але Heading не дає надійної геометричної осі АС."
             ),
+            "radioDegradationAngle": None,
+            "radioDegradationReason": None,
+            "radioDegradationStrength": None,
+            "radioDegradationDetected": False,
             "confidence": confidence,
             "sampleCount": len(
                 heading_samples
