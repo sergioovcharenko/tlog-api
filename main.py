@@ -92,6 +92,13 @@ ANTENNA_MIN_RADIO_SAMPLES = 15
 ANTENNA_TOP_SIGNAL_FRACTION = 0.30
 ANTENNA_SAMPLE_MAX_GAP_SEC = 2.2
 
+# V16 — safety guard for V12 360° axis refinement.
+# The radio optimizer may REFINE the initial axis, but must not flip
+# the antenna to a weak/ambiguous opposite candidate.
+ANTENNA_AXIS_MIN_SCORE_GAP = 1.0
+ANTENNA_AXIS_MAX_REFINEMENT_SHIFT_DEG = 90.0
+ANTENNA_AXIS_ALLOWED_STABILITIES = {"MEDIUM", "HIGH"}
+
 # 5-ознакова модель ймовірного виходу БПЛА за сектор АС.
 # Це НЕ окремий "датчик", а сукупність незалежних ознак.
 ANTENNA_TREND_LOOKBACK_SEC = 15.0
@@ -251,6 +258,9 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
         "axisStability": None,
         "axisUncertaintyDeg": None,
         "axisOptimizationUsed": False,
+        "axisOptimizationRejected": False,
+        "axisOptimizationRejectReason": None,
+        "axisCandidateShiftDeg": None,
         "axisInsideMedianDbm": None,
         "axisOutsideMedianDbm": None,
         "axisInsideCount": 0,
@@ -1016,7 +1026,8 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 and axis_best["outsideCount"] >= 8
             )
 
-            axis_optimization_used = bool(
+            # First calculate the optimizer's evidence quality.
+            raw_axis_candidate_ok = bool(
                 sufficient_radio_separation
                 and sufficient_counts
             )
@@ -1039,9 +1050,70 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
                 else:
                     axis_stability = "LOW"
 
+            # V16: compare the 360° winner with the INITIAL radio/geometric axis.
+            # The optimizer is allowed to REFINE the axis, not blindly replace it.
+            axis_candidate_shift = (
+                heading_difference_deg(
+                    axis_best["axis"],
+                    axis_initial,
+                )
+                if (
+                    axis_best is not None
+                    and valid_number(axis_initial)
+                )
+                else None
+            )
+
+            axis_reject_reasons = []
+
+            if not raw_axis_candidate_ok:
+                axis_reject_reasons.append(
+                    "недостатнє радіорозділення або замало зразків"
+                )
+
+            if axis_stability not in ANTENNA_AXIS_ALLOWED_STABILITIES:
+                axis_reject_reasons.append(
+                    "низька стабільність радіокандидата"
+                )
+
+            if (
+                axis_gap is None
+                or axis_gap < ANTENNA_AXIS_MIN_SCORE_GAP
+            ):
+                axis_reject_reasons.append(
+                    "слабкий відрив від другого кандидата"
+                )
+
+            if (
+                valid_number(axis_candidate_shift)
+                and axis_candidate_shift
+                > ANTENNA_AXIS_MAX_REFINEMENT_SHIFT_DEG
+            ):
+                axis_reject_reasons.append(
+                    "розворот >90° — можлива задня пелюстка / 180° неоднозначність"
+                )
+
+            axis_optimization_used = bool(
+                raw_axis_candidate_ok
+                and not axis_reject_reasons
+            )
+
+            axis_optimization_rejected = bool(
+                axis_best is not None
+                and not axis_optimization_used
+            )
+
+            axis_optimization_reject_reason = (
+                "; ".join(axis_reject_reasons)
+                if axis_reject_reasons
+                else None
+            )
+
             if axis_optimization_used:
                 reference = axis_best["axis"]
 
+        # Applied shift. If V16 rejects the radio candidate, this stays 0°
+        # because the initial axis remains the actual sector axis.
         axis_shift = (
             heading_difference_deg(
                 reference,
@@ -1053,6 +1125,12 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             )
             else None
         )
+
+        # Ensure variables exist even when no axis_trials were available.
+        if not axis_trials:
+            axis_candidate_shift = None
+            axis_optimization_rejected = False
+            axis_optimization_reject_reason = None
 
         top_scores = [
             x["score"]
@@ -1728,6 +1806,17 @@ def estimate_map_antenna_direction(raw_timeline, flight_number):
             ),
             "axisOptimizationUsed": bool(
                 axis_optimization_used
+            ),
+            "axisOptimizationRejected": bool(
+                axis_optimization_rejected
+            ),
+            "axisOptimizationRejectReason": (
+                axis_optimization_reject_reason
+            ),
+            "axisCandidateShiftDeg": (
+                round(axis_candidate_shift, 1)
+                if valid_number(axis_candidate_shift)
+                else None
             ),
             "axisInsideMedianDbm": (
                 round(axis_best["insideMedian"], 2)
