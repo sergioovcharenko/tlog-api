@@ -46,6 +46,25 @@ THRUST_DESCENT_DELTA_MPS = 3.0
 THRUST_DESCENT_MIN_MPS = 5.0
 THRUST_VOLTAGE_DROP_V = 1.0
 
+# V15 — EKF / optical-navigation pilot-action rules.
+# User operational rule:
+#   LOITER + EKF variance -> switch to ALT HOLD.
+#   If ALT HOLD follows promptly, the EKF variance / stopped aiding sequence
+#   is treated as an expected transition, not as a flight-critical EKF fault.
+EKF_ALT_HOLD_CORRECT_SEC = 5.0
+EKF_ALT_HOLD_LATE_SEC = 10.0
+
+# Repeated stopped aiding in LOITER approximately every second indicates
+# optical-navigation aiding is not working reliably.
+EKF_STOPPED_AIDING_REPEAT_MIN_COUNT = 3
+EKF_STOPPED_AIDING_REPEAT_MIN_GAP_SEC = 0.5
+EKF_STOPPED_AIDING_REPEAT_MAX_GAP_SEC = 1.5
+
+# "stopped aiding" shortly after LOITER -> ALT HOLD is considered normal
+# when preceded by EKF variance in LOITER.
+EKF_STOPPED_AIDING_NORMAL_AFTER_SWITCH_SEC = 5.0
+EKF_VARIANCE_LOOKBACK_BEFORE_SWITCH_SEC = 10.0
+
 # LAND diagnostics.
 # ArduPilot LAND_SPEED / LAND_SPEED_HIGH are stored in cm/s,
 # LAND_ALT_LOW in cm.
@@ -2893,6 +2912,12 @@ async def analyze(file: UploadFile = File(...)):
 
         ekf_variance_count = 0
         ekf_stopped_aiding_count = 0
+
+        # V15 — preserve exact EKF event timestamps + flight mode.
+        ekf_variance_events = []
+        ekf_stopped_aiding_events = []
+        mode_transition_events = []
+
         loiter_position_fail_count = 0
         external_nav_recovery_count = 0
         smart_rtl_bad_position_count = 0
@@ -3256,8 +3281,25 @@ async def analyze(file: UploadFile = File(...)):
 
             if "ekf variance" in txt_lower:
                 ekf_variance_count += 1
+                ekf_variance_events.append({
+                    "timestamp": float(timestamp),
+                    "mode": current_mode,
+                    "text": full_txt,
+                })
 
-            if "stopped aiding" in txt_lower:
+            if (
+                "stopped aiding" in txt_lower
+                and "ekf3 imu0" in txt_lower
+            ):
+                ekf_stopped_aiding_count += 1
+                ekf_stopped_aiding_events.append({
+                    "timestamp": float(timestamp),
+                    "mode": current_mode,
+                    "text": full_txt,
+                })
+            elif "stopped aiding" in txt_lower:
+                # Keep legacy count for other stopped-aiding texts, but V15
+                # optical-navigation logic below is specifically for EKF3 IMU0.
                 ekf_stopped_aiding_count += 1
 
             if "mode change to loiter failed" in txt_lower and "requires position" in txt_lower:
@@ -3418,7 +3460,15 @@ async def analyze(file: UploadFile = File(...)):
                     is_currently_armed = is_armed
 
                     if new_mode and new_mode != current_mode:
-                        if current_mode != "Невідомо":
+                        previous_mode = current_mode
+
+                        if previous_mode != "Невідомо":
+                            mode_transition_events.append({
+                                "timestamp": float(current_timestamp),
+                                "from": previous_mode,
+                                "to": new_mode,
+                            })
+
                             add_event(
                                 f"🔄 Режим змінено на {new_mode}",
                                 current_timestamp,
@@ -5002,34 +5052,422 @@ async def analyze(file: UploadFile = File(...)):
                     f"initial pos NED. Приклад: {examples} м."
                 )
 
-        # EKF / External navigation
+        # ====================================================
+        # V15 — EKF / OPTICAL NAVIGATION / PILOT ACTION
+        # ====================================================
+        #
+        # Operational rule:
+        #   LOITER + EKF variance -> pilot should switch to ALT HOLD.
+        #
+        # Normal transition:
+        #   LOITER -> EKF variance -> ALT HOLD -> EKF3 IMU0 stopped aiding
+        #
+        # Repeated "EKF3 IMU0 stopped aiding" approximately once per second
+        # while still in LOITER means optical-navigation aiding is not working.
+        # The conclusion must link to the first event time.
+        def _mode_key(value):
+            return (
+                str(value or "")
+                .upper()
+                .replace(" ", "")
+                .replace("_", "")
+                .replace("-", "")
+            )
+
+        def _is_loiter(value):
+            return _mode_key(value) == "LOITER"
+
+        def _is_alt_hold(value):
+            return _mode_key(value) == "ALTHOLD"
+
+        def _loiter_to_alt_hold_transitions():
+            return [
+                x
+                for x in mode_transition_events
+                if (
+                    _is_loiter(x.get("from"))
+                    and _is_alt_hold(x.get("to"))
+                )
+            ]
+
+        loiter_alt_hold_transitions = _loiter_to_alt_hold_transitions()
+
+        def _first_alt_hold_after(timestamp, max_sec=None):
+            candidates = [
+                x
+                for x in loiter_alt_hold_transitions
+                if float(x["timestamp"]) >= float(timestamp)
+            ]
+
+            if max_sec is not None:
+                candidates = [
+                    x
+                    for x in candidates
+                    if (
+                        float(x["timestamp"]) - float(timestamp)
+                        <= float(max_sec)
+                    )
+                ]
+
+            if not candidates:
+                return None
+
+            return min(
+                candidates,
+                key=lambda x: float(x["timestamp"]),
+            )
+
+        # ----------------------------------------------------
+        # A) EKF variance in LOITER -> evaluate pilot response.
+        # ----------------------------------------------------
+        ekf_action_checks = []
+
+        for ev in ekf_variance_events:
+            if not _is_loiter(ev.get("mode")):
+                continue
+
+            ev_ts = float(ev["timestamp"])
+            transition = _first_alt_hold_after(
+                ev_ts,
+                EKF_ALT_HOLD_LATE_SEC,
+            )
+
+            if transition is None:
+                status = "MISSING"
+                reaction_sec = None
+
+            else:
+                reaction_sec = (
+                    float(transition["timestamp"])
+                    - ev_ts
+                )
+
+                if reaction_sec <= EKF_ALT_HOLD_CORRECT_SEC:
+                    status = "CORRECT"
+                else:
+                    status = "LATE"
+
+            ekf_action_checks.append({
+                "timestamp": ev_ts,
+                "mode": ev.get("mode"),
+                "status": status,
+                "reactionSec": (
+                    round(reaction_sec, 2)
+                    if reaction_sec is not None
+                    else None
+                ),
+                "altHoldTimestamp": (
+                    float(transition["timestamp"])
+                    if transition is not None
+                    else None
+                ),
+            })
+
+        # ----------------------------------------------------
+        # B) Detect repeated EKF3 IMU0 stopped aiding in LOITER.
+        #     Consecutive gaps ~1 sec, minimum 3 messages.
+        # ----------------------------------------------------
+        loiter_stopped = sorted(
+            [
+                x
+                for x in ekf_stopped_aiding_events
+                if _is_loiter(x.get("mode"))
+            ],
+            key=lambda x: float(x["timestamp"]),
+        )
+
+        stopped_aiding_series = []
+        current_series = []
+
+        for ev in loiter_stopped:
+            if not current_series:
+                current_series = [ev]
+                continue
+
+            gap = (
+                float(ev["timestamp"])
+                - float(current_series[-1]["timestamp"])
+            )
+
+            if (
+                EKF_STOPPED_AIDING_REPEAT_MIN_GAP_SEC
+                <= gap
+                <= EKF_STOPPED_AIDING_REPEAT_MAX_GAP_SEC
+            ):
+                current_series.append(ev)
+            else:
+                if (
+                    len(current_series)
+                    >= EKF_STOPPED_AIDING_REPEAT_MIN_COUNT
+                ):
+                    stopped_aiding_series.append(
+                        current_series
+                    )
+                current_series = [ev]
+
         if (
-            ekf_variance_count
-            or ekf_stopped_aiding_count
-            or loiter_position_fail_count
-            or smart_rtl_bad_position_count
+            len(current_series)
+            >= EKF_STOPPED_AIDING_REPEAT_MIN_COUNT
         ):
-            parts = []
+            stopped_aiding_series.append(
+                current_series
+            )
 
-            if ekf_variance_count:
-                parts.append(f"EKF variance: {ekf_variance_count}")
+        optical_navigation_failures = []
 
-            if ekf_stopped_aiding_count:
-                parts.append(f"stopped aiding: {ekf_stopped_aiding_count}")
+        for series in stopped_aiding_series:
+            first_ts = float(series[0]["timestamp"])
+            last_ts = float(series[-1]["timestamp"])
 
-            if loiter_position_fail_count:
-                parts.append(
-                    f"LOITER requires position: {loiter_position_fail_count}"
+            transition = _first_alt_hold_after(
+                first_ts,
+                EKF_ALT_HOLD_LATE_SEC,
+            )
+
+            reaction_sec = (
+                float(transition["timestamp"]) - first_ts
+                if transition is not None
+                else None
+            )
+
+            if reaction_sec is None:
+                pilot_response = "MISSING"
+            elif reaction_sec <= EKF_ALT_HOLD_CORRECT_SEC:
+                pilot_response = "CORRECT"
+            else:
+                pilot_response = "LATE"
+
+            gaps = [
+                float(series[i]["timestamp"])
+                - float(series[i - 1]["timestamp"])
+                for i in range(1, len(series))
+            ]
+
+            mean_gap = (
+                sum(gaps) / len(gaps)
+                if gaps
+                else None
+            )
+
+            optical_navigation_failures.append({
+                "firstTimestamp": first_ts,
+                "lastTimestamp": last_ts,
+                "count": len(series),
+                "meanGapSec": (
+                    round(mean_gap, 2)
+                    if mean_gap is not None
+                    else None
+                ),
+                "pilotResponse": pilot_response,
+                "reactionSec": (
+                    round(reaction_sec, 2)
+                    if reaction_sec is not None
+                    else None
+                ),
+                "altHoldTimestamp": (
+                    float(transition["timestamp"])
+                    if transition is not None
+                    else None
+                ),
+            })
+
+        # ----------------------------------------------------
+        # C) "stopped aiding" shortly AFTER LOITER -> ALT_HOLD
+        #    is normal if EKF variance was seen shortly before.
+        # ----------------------------------------------------
+        normal_stopped_after_switch = []
+        abnormal_stopped_events = []
+
+        for ev in ekf_stopped_aiding_events:
+            ev_ts = float(ev["timestamp"])
+
+            matching_transition = None
+
+            for tr in loiter_alt_hold_transitions:
+                tr_ts = float(tr["timestamp"])
+                dt = ev_ts - tr_ts
+
+                if (
+                    0.0 <= dt
+                    <= EKF_STOPPED_AIDING_NORMAL_AFTER_SWITCH_SEC
+                ):
+                    matching_transition = tr
+                    break
+
+            preceded_by_variance = False
+
+            if matching_transition is not None:
+                tr_ts = float(
+                    matching_transition["timestamp"]
                 )
 
-            if smart_rtl_bad_position_count:
-                parts.append(
-                    f"SmartRTL bad position: {smart_rtl_bad_position_count}"
+                preceded_by_variance = any(
+                    (
+                        _is_loiter(v.get("mode"))
+                        and 0.0
+                        <= tr_ts - float(v["timestamp"])
+                        <= EKF_VARIANCE_LOOKBACK_BEFORE_SWITCH_SEC
+                    )
+                    for v in ekf_variance_events
                 )
+
+            if (
+                matching_transition is not None
+                and preceded_by_variance
+            ):
+                normal_stopped_after_switch.append(ev)
+            else:
+                abnormal_stopped_events.append(ev)
+
+        # ----------------------------------------------------
+        # D) AI conclusions.
+        # ----------------------------------------------------
+        for check in ekf_action_checks:
+            event_time = format_timeline_time(
+                check["timestamp"],
+                base_t,
+            )
+
+            if check["status"] == "CORRECT":
+                alt_time = format_timeline_time(
+                    check["altHoldTimestamp"],
+                    base_t,
+                )
+
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{event_time}">'
+                    "✅ <b>EKF variance у LOITER — реакція пілота штатна:</b> "
+                    f"подія {event_time}; перехід у ALT HOLD {alt_time} "
+                    f"через {check['reactionSec']:.1f} с. "
+                    "За прийнятим алгоритмом ця EKF variance не класифікується "
+                    "як критична помилка польоту. "
+                    "Натисніть, щоб перейти до EKF variance у Timeline."
+                    "</span>"
+                )
+
+            elif check["status"] == "LATE":
+                alt_time = format_timeline_time(
+                    check["altHoldTimestamp"],
+                    base_t,
+                )
+
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{event_time}">'
+                    "⚠️ <b>EKF variance у LOITER — запізнілий перехід у ALT HOLD:</b> "
+                    f"подія {event_time}; ALT HOLD {alt_time}; "
+                    f"час реакції {check['reactionSec']:.1f} с. "
+                    f"Бажаний перехід — до {EKF_ALT_HOLD_CORRECT_SEC:.0f} с. "
+                    "Натисніть, щоб перейти до події в Timeline."
+                    "</span>"
+                )
+
+            else:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{event_time}">'
+                    "⚠️ <b>EKF variance у LOITER — перехід у ALT HOLD не зафіксовано:</b> "
+                    f"перша подія {event_time}. "
+                    "За прийнятим алгоритмом при EKF variance у LOITER "
+                    "пілот має перейти в ALT HOLD. "
+                    "Натисніть, щоб перейти до EKF variance у Timeline."
+                    "</span>"
+                )
+
+        # Strong user-requested optical-navigation conclusion.
+        for failure in optical_navigation_failures:
+            first_time = format_timeline_time(
+                failure["firstTimestamp"],
+                base_t,
+            )
+            last_time = format_timeline_time(
+                failure["lastTimestamp"],
+                base_t,
+            )
+
+            response_text = ""
+
+            if failure["pilotResponse"] == "CORRECT":
+                alt_time = format_timeline_time(
+                    failure["altHoldTimestamp"],
+                    base_t,
+                )
+                response_text = (
+                    f" Пілот перейшов у ALT HOLD {alt_time} "
+                    f"через {failure['reactionSec']:.1f} с після початку серії."
+                )
+
+            elif failure["pilotResponse"] == "LATE":
+                alt_time = format_timeline_time(
+                    failure["altHoldTimestamp"],
+                    base_t,
+                )
+                response_text = (
+                    f" Перехід у ALT HOLD був запізнілим: {alt_time}, "
+                    f"через {failure['reactionSec']:.1f} с."
+                )
+
+            else:
+                response_text = (
+                    " Перехід у ALT HOLD після початку повторюваних "
+                    "повідомлень не зафіксовано."
+                )
+
+            mean_gap_text = (
+                f"{failure['meanGapSec']:.1f} с"
+                if failure.get("meanGapSec") is not None
+                else "—"
+            )
 
             ai_alerts.append(
-                "⚠️ <b>Нестабільність позиціонування / EKF:</b> "
-                + "; ".join(parts)
+                f'<span class="ai-jump" data-jump-time="{first_time}">'
+                "🚨 <b>Модуль оптичної навігації не працює.</b> "
+                f"У LOITER повідомлення «EKF3 IMU0 stopped aiding» "
+                f"повторилося {failure['count']} раз(и) "
+                f"з середнім інтервалом {mean_gap_text}; "
+                f"серія {first_time}–{last_time}."
+                + response_text
+                + " Натисніть, щоб перейти до першого stopped aiding у Timeline."
+                + "</span>"
+            )
+
+        # One compact information line for the expected sequence after switch.
+        if normal_stopped_after_switch:
+            first_normal = min(
+                normal_stopped_after_switch,
+                key=lambda x: float(x["timestamp"]),
+            )
+            normal_time = format_timeline_time(
+                first_normal["timestamp"],
+                base_t,
+            )
+
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{normal_time}">'
+                "ℹ️ <b>EKF3 IMU0 stopped aiding після переходу "
+                "LOITER → ALT HOLD:</b> зафіксовано після EKF variance "
+                "та штатного переходу в ALT HOLD. За прийнятою логікою "
+                "цей stopped aiding є нормальною частиною завершення "
+                "позиційного aiding і не піднімається як критична помилка. "
+                "Натисніть, щоб перейти до повідомлення у Timeline."
+                "</span>"
+            )
+
+        # Other EKF positioning events remain summarized separately.
+        other_ekf_parts = []
+
+        if loiter_position_fail_count:
+            other_ekf_parts.append(
+                f"LOITER requires position: {loiter_position_fail_count}"
+            )
+
+        if smart_rtl_bad_position_count:
+            other_ekf_parts.append(
+                f"SmartRTL bad position: {smart_rtl_bad_position_count}"
+            )
+
+        if other_ekf_parts:
+            ai_alerts.append(
+                "⚠️ <b>Інші події позиціонування / EKF:</b> "
+                + "; ".join(other_ekf_parts)
                 + "."
             )
 
@@ -6001,11 +6439,17 @@ async def analyze(file: UploadFile = File(...)):
             is_critical = True
 
         # Final verdict
+        # V15: expected EKF variance -> ALT HOLD -> stopped aiding must not
+        # turn an otherwise successful flight yellow by itself.
         navigation_problem = (
-            ekf_variance_count > 0
-            or ekf_stopped_aiding_count > 0
+            any(
+                x.get("status") in ("LATE", "MISSING")
+                for x in ekf_action_checks
+            )
+            or bool(optical_navigation_failures)
             or loiter_position_fail_count > 0
             or smart_rtl_bad_position_count > 0
+            or bool(abnormal_stopped_events)
         )
 
         # Calibration / ground context has the highest verdict priority.
@@ -6085,6 +6529,17 @@ async def analyze(file: UploadFile = File(...)):
                 "repeatedNedInitializationCount": len(repeated_ned_initializations),
                 "ekfVarianceCount": ekf_variance_count,
                 "ekfStoppedAidingCount": ekf_stopped_aiding_count,
+
+                # V15 EKF pilot-action diagnostics.
+                "ekfActionChecks": ekf_action_checks,
+                "opticalNavigationFailures": optical_navigation_failures,
+                "normalStoppedAidingAfterAltHoldCount": len(
+                    normal_stopped_after_switch
+                ),
+                "abnormalStoppedAidingCount": len(
+                    abnormal_stopped_events
+                ),
+
                 "loiterPositionFailCount": loiter_position_fail_count,
                 "externalNavRecoveryCount": external_nav_recovery_count,
                 "smartRtlBadPositionCount": smart_rtl_bad_position_count,
