@@ -27,6 +27,14 @@ RADIO_LINK_LOST_DBM = -128.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
 ATTITUDE_CRITICAL_THRESHOLD_DEG = 35.0
 
+# V20 — percentage display for all four primary control axes (CH1..CH4).
+# Percent is measured from calibrated TRIM/center toward MIN/MAX.
+CONTROL_CENTER_DEADBAND_US = 25.0
+CONTROL_AXIS_REVERSED = {1: False, 2: False, 3: False, 4: False}
+# Compatibility aliases used by the previous V19 throttle block.
+THROTTLE_CENTER_DEADBAND_US = CONTROL_CENTER_DEADBAND_US
+THROTTLE_REVERSED = CONTROL_AXIS_REVERSED[3]
+
 # RPM / motor diagnostics for this QUAD X numbering:
 # diagonal pairs: Motor 1 <-> Motor 2 and Motor 3 <-> Motor 4.
 RPM_DIAGONAL_PAIRS = ((0, 1), (2, 3))
@@ -2956,6 +2964,22 @@ async def analyze(file: UploadFile = File(...)):
         last_rc_state = {i: 0 for i in range(1, 19)}
         max_throttle = 0
 
+        # V20 — primary stick controls CH1 Roll, CH2 Pitch, CH3 Throttle, CH4 Yaw.
+        # Prefer RCx_MIN/TRIM/MAX embedded in the TLOG; otherwise use 1000/1500/2000 us.
+        rc_axis_cal = {
+            ch: {f"RC{ch}_MIN": None, f"RC{ch}_TRIM": None, f"RC{ch}_MAX": None}
+            for ch in range(1, 5)
+        }
+        curr_control_pwm = {ch: None for ch in range(1, 5)}
+        control_extremes = {
+            ch: {"negative": 0.0, "positive": 0.0}
+            for ch in range(1, 5)
+        }
+        # V19 compatibility values for CH3.
+        curr_ch3_pwm = None
+        throttle_max_up_pct = 0.0
+        throttle_max_down_pct = 0.0
+
         # V18 — TX16S named-switch diagnostics.
         tx16_switch_pwm = {"SC": None, "SD": None, "SF": None, "SH": None}
         tx16_switch_state = {"SC": None, "SD": None, "SF": None, "SH": None}
@@ -3211,6 +3235,97 @@ async def analyze(file: UploadFile = File(...)):
                 "pairsText": "M1↔M2, M3↔M4",
             }
 
+        CONTROL_AXIS_META = {
+            1: {"key": "roll", "name": "Roll", "positive": "RIGHT", "negative": "LEFT",
+                "positiveLabel": "→ Праворуч", "negativeLabel": "← Ліворуч"},
+            2: {"key": "pitch", "name": "Pitch", "positive": "BACK", "negative": "FORWARD",
+                "positiveLabel": "↓ До себе", "negativeLabel": "↑ Від себе"},
+            3: {"key": "throttle", "name": "Throttle", "positive": "UP", "negative": "DOWN",
+                "positiveLabel": "↑ Вгору", "negativeLabel": "↓ Вниз"},
+            4: {"key": "yaw", "name": "Yaw", "positive": "RIGHT", "negative": "LEFT",
+                "positiveLabel": "→ Праворуч", "negativeLabel": "← Ліворуч"},
+        }
+
+        def control_calibration(ch_num):
+            cal = rc_axis_cal.get(ch_num, {})
+            min_pwm = cal.get(f"RC{ch_num}_MIN")
+            trim_pwm = cal.get(f"RC{ch_num}_TRIM")
+            max_pwm = cal.get(f"RC{ch_num}_MAX")
+
+            min_pwm = float(min_pwm) if valid_number(min_pwm) and 800 < float(min_pwm) < 1400 else 1000.0
+            max_pwm = float(max_pwm) if valid_number(max_pwm) and 1600 < float(max_pwm) < 2200 else 2000.0
+
+            if not (min_pwm + 100 < max_pwm):
+                min_pwm, max_pwm = 1000.0, 2000.0
+
+            if valid_number(trim_pwm) and min_pwm + 100 < float(trim_pwm) < max_pwm - 100:
+                center_pwm = float(trim_pwm)
+            else:
+                center_pwm = (min_pwm + max_pwm) / 2.0
+
+            return min_pwm, center_pwm, max_pwm
+
+        def control_snapshot(ch_num, pwm=None):
+            value = curr_control_pwm.get(ch_num) if pwm is None else pwm
+            if not valid_number(value):
+                return None
+
+            value = float(value)
+            if not 800 < value < 2200:
+                return None
+
+            meta = CONTROL_AXIS_META[ch_num]
+            min_pwm, center_pwm, max_pwm = control_calibration(ch_num)
+            delta = value - center_pwm
+
+            if CONTROL_AXIS_REVERSED.get(ch_num, False):
+                delta = -delta
+
+            if abs(delta) <= CONTROL_CENTER_DEADBAND_US:
+                side = "CENTER"
+                pct = 0.0
+                label = "Центр 0%"
+                short_label = "0%"
+            elif delta > 0:
+                span = max(1.0, max_pwm - center_pwm)
+                pct = min(100.0, max(0.0, abs(delta) / span * 100.0))
+                side = meta["positive"]
+                label = f"{meta['positiveLabel']} {pct:.0f}%"
+                short_label = f"{meta['positiveLabel'].split()[0]} {pct:.0f}%"
+            else:
+                span = max(1.0, center_pwm - min_pwm)
+                pct = min(100.0, max(0.0, abs(delta) / span * 100.0))
+                side = meta["negative"]
+                label = f"{meta['negativeLabel']} {pct:.0f}%"
+                short_label = f"{meta['negativeLabel'].split()[0]} {pct:.0f}%"
+
+            return {
+                "channel": ch_num,
+                "axis": meta["key"],
+                "name": meta["name"],
+                "pwm": int(round(value)),
+                "direction": side,
+                "percent": round(pct, 1),
+                "label": label,
+                "shortLabel": short_label,
+                "centerPwm": int(round(center_pwm)),
+                "minPwm": int(round(min_pwm)),
+                "maxPwm": int(round(max_pwm)),
+            }
+
+        def controls_snapshot():
+            return {
+                CONTROL_AXIS_META[ch]["key"]: control_snapshot(ch)
+                for ch in range(1, 5)
+            }
+
+        # V19 compatibility wrappers.
+        def throttle_calibration():
+            return control_calibration(3)
+
+        def throttle_snapshot(pwm=None):
+            return control_snapshot(3, pwm)
+
         def is_serious_system_text(text):
             t = str(text or "").lower()
             serious_patterns = (
@@ -3271,6 +3386,8 @@ async def analyze(file: UploadFile = File(...)):
                     "attitude": attitude_snapshot(),
                     "rpmAnalysis": rpm_analysis_snapshot(),
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
+                    "throttle": throttle_snapshot(),
+                    "controls": controls_snapshot(),
                     # Raw ArduPilot STATUSTEXT stays in "system_text".
                     # Our own calculated/synthetic events go to "analysis_text".
                     "system_text": (
@@ -3328,6 +3445,8 @@ async def analyze(file: UploadFile = File(...)):
                     "attitude": attitude_snapshot(),
                     "rpmAnalysis": rpm_analysis_snapshot(),
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
+                    "throttle": throttle_snapshot(),
+                    "controls": controls_snapshot(),
                     "system_text": "",
                     "analysis_text": "",
                     "pilot_text": "",
@@ -3738,10 +3857,16 @@ async def analyze(file: UploadFile = File(...)):
                         param_id = str(raw_param_id)
                     param_id = param_id.strip("\x00 ").upper()
 
-                    if param_id in land_params:
-                        value = getattr(msg, "param_value", None)
-                        if valid_number(value):
-                            land_params[param_id] = float(value)
+                    value = getattr(msg, "param_value", None)
+
+                    if param_id in land_params and valid_number(value):
+                        land_params[param_id] = float(value)
+
+                    if valid_number(value):
+                        for ch_num in range(1, 5):
+                            if param_id in rc_axis_cal[ch_num]:
+                                rc_axis_cal[ch_num][param_id] = float(value)
+                                break
                 except Exception:
                     pass
 
@@ -3958,6 +4083,29 @@ async def analyze(file: UploadFile = File(...)):
                             rc_max[ch_num],
                             val,
                         )
+
+                # V20 — update all four primary control axes and their maximum deflection.
+                for control_ch in range(1, 5):
+                    control_val = channels.get(control_ch, 0)
+                    if valid_number(control_val) and 800 < float(control_val) < 2200:
+                        curr_control_pwm[control_ch] = int(round(float(control_val)))
+                        state = control_snapshot(control_ch, curr_control_pwm[control_ch])
+                        if state is not None and state.get("direction") != "CENTER":
+                            meta = CONTROL_AXIS_META[control_ch]
+                            bucket = (
+                                "positive"
+                                if state.get("direction") == meta["positive"]
+                                else "negative"
+                            )
+                            control_extremes[control_ch][bucket] = max(
+                                control_extremes[control_ch][bucket],
+                                float(state.get("percent", 0.0)),
+                            )
+
+                # V19 compatibility for CH3.
+                curr_ch3_pwm = curr_control_pwm.get(3)
+                throttle_max_up_pct = control_extremes[3]["positive"]
+                throttle_max_down_pct = control_extremes[3]["negative"]
 
                 # Existing VTX logic remains unchanged.
                 ch7 = channels.get(7, 0)
@@ -5193,6 +5341,8 @@ async def analyze(file: UploadFile = File(...)):
                     "attitude": ev.get("attitude"),
                     "rpmAnalysis": ev.get("rpmAnalysis"),
                     "verticalSpeedDown": ev.get("verticalSpeedDown"),
+                    "throttle": ev.get("throttle"),
+                    "controls": ev.get("controls"),
                     "flightNumber": ev.get("flightNumber"),
                     "takeoffEpisodeNumber": ev.get("takeoffEpisodeNumber"),
                     "systemText": ev.get("system_text", ""),
@@ -7151,6 +7301,43 @@ async def analyze(file: UploadFile = File(...)):
                     }
                     for i in range(4)
                 ],
+            },
+            "controls": {
+                "deadbandUs": CONTROL_CENTER_DEADBAND_US,
+                "axes": {
+                    CONTROL_AXIS_META[ch]["key"]: {
+                        "channel": ch,
+                        "current": control_snapshot(ch),
+                        "maxNegativePct": round(control_extremes[ch]["negative"], 1),
+                        "maxPositivePct": round(control_extremes[ch]["positive"], 1),
+                        "negativeLabel": CONTROL_AXIS_META[ch]["negativeLabel"],
+                        "positiveLabel": CONTROL_AXIS_META[ch]["positiveLabel"],
+                        "calibration": {
+                            "min": int(round(control_calibration(ch)[0])),
+                            "trim": int(round(control_calibration(ch)[1])),
+                            "max": int(round(control_calibration(ch)[2])),
+                            "source": (
+                                f"TLOG RC{ch}_MIN/TRIM/MAX"
+                                if all(valid_number(rc_axis_cal[ch].get(f"RC{ch}_{suffix}")) for suffix in ("MIN", "TRIM", "MAX"))
+                                else "fallback / partial TLOG calibration"
+                            ),
+                        },
+                    }
+                    for ch in range(1, 5)
+                },
+            },
+            "throttle": {
+                "current": throttle_snapshot(),
+                "maxUpPct": round(throttle_max_up_pct, 1),
+                "maxDownPct": round(throttle_max_down_pct, 1),
+                "deadbandUs": THROTTLE_CENTER_DEADBAND_US,
+                "reversed": THROTTLE_REVERSED,
+                "calibration": {
+                    "min": throttle_snapshot().get("minPwm") if throttle_snapshot() else int(round(throttle_calibration()[0])),
+                    "trim": throttle_snapshot().get("centerPwm") if throttle_snapshot() else int(round(throttle_calibration()[1])),
+                    "max": throttle_snapshot().get("maxPwm") if throttle_snapshot() else int(round(throttle_calibration()[2])),
+                    "source": "TLOG RC3_MIN/TRIM/MAX" if all(valid_number(rc_axis_cal[3].get(k)) for k in ("RC3_MIN", "RC3_TRIM", "RC3_MAX")) else "fallback / partial TLOG calibration",
+                },
             },
             "radioChannels": {
                 "ch1": (
