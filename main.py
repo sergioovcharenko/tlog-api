@@ -27,7 +27,7 @@ RADIO_LINK_LOST_DBM = -128.0
 VIBRATION_CRITICAL_THRESHOLD = 36.0
 ATTITUDE_CRITICAL_THRESHOLD_DEG = 35.0
 
-# V20 — percentage display for all four primary control axes (CH1..CH4).
+# V21 — percentage display for all four primary control axes (CH1..CH4).
 # Percent is measured from calibrated TRIM/center toward MIN/MAX.
 CONTROL_CENTER_DEADBAND_US = 25.0
 CONTROL_AXIS_REVERSED = {1: False, 2: False, 3: False, 4: False}
@@ -141,6 +141,13 @@ PAYLOAD_SERVO_CORRELATION_SEC = 3.0
 EMERGENCY_STOP_MIN_HOLD_SEC = 8.0
 EMERGENCY_STOP_EXPECTED_HOLD_SEC = 10.0
 EMERGENCY_DISARM_CORRELATION_SEC = 3.0
+
+# V21 — motor diagnostics are deliberately split into two independent signals:
+#   * SERVO_OUTPUT_RAW -> output command in microseconds (PWM-like value)
+#   * ESC_TELEMETRY_1_TO_4.rpm -> RPM value reported by ArduPilot ESC telemetry
+# Never treat 1500 us as 1500 RPM and never auto-divide RPM by motor pole count.
+MOTOR_COUNT = 4
+MOTOR_FUNCTION_BASE = 33  # SERVOx_FUNCTION 33..36 = Motor1..Motor4 in ArduPilot
 
 VTX_CHANNELS = {
     1: {1: 5180, 2: 5240, 3: 5300},
@@ -2964,7 +2971,7 @@ async def analyze(file: UploadFile = File(...)):
         last_rc_state = {i: 0 for i in range(1, 19)}
         max_throttle = 0
 
-        # V20 — primary stick controls CH1 Roll, CH2 Pitch, CH3 Throttle, CH4 Yaw.
+        # V21 — primary stick controls CH1 Roll, CH2 Pitch, CH3 Throttle, CH4 Yaw.
         # Prefer RCx_MIN/TRIM/MAX embedded in the TLOG; otherwise use 1000/1500/2000 us.
         rc_axis_cal = {
             ch: {f"RC{ch}_MIN": None, f"RC{ch}_TRIM": None, f"RC{ch}_MAX": None}
@@ -2986,7 +2993,15 @@ async def analyze(file: UploadFile = File(...)):
         payload_commands = []
         pending_payload_command = None
         servo_output_last = {i: None for i in range(1, 17)}
+        servo_output_current = {i: None for i in range(1, 17)}
+        servo_output_min = {i: None for i in range(1, 17)}
+        servo_output_max = {i: None for i in range(1, 17)}
         servo_output_events = []
+
+        # SERVOx_FUNCTION values received through PARAM_VALUE.  For motors 1..4
+        # ArduPilot uses functions 33..36.  If parameters are absent from a TLOG,
+        # the analyser falls back to outputs 1..4 and clearly marks that fallback.
+        servo_functions = {i: None for i in range(1, 17)}
 
         emergency_stop_attempts = []
         active_emergency_attempt = None
@@ -3319,6 +3334,58 @@ async def analyze(file: UploadFile = File(...)):
                 for ch in range(1, 5)
             }
 
+        def motor_servo_channel(motor_id):
+            """Return (servo_channel, source) for Motor1..Motor4."""
+            target_function = MOTOR_FUNCTION_BASE + int(motor_id) - 1
+            matches = [
+                ch for ch, fn in servo_functions.items()
+                if valid_number(fn) and int(round(float(fn))) == target_function
+            ]
+            if matches:
+                return min(matches), "SERVOx_FUNCTION"
+            # Safe display fallback only; this does not claim that the wiring is standard.
+            return int(motor_id), "fallback output 1-4"
+
+        def motor_output_snapshot():
+            result = []
+            for motor_id in range(1, MOTOR_COUNT + 1):
+                servo_ch, source = motor_servo_channel(motor_id)
+                pwm = servo_output_current.get(servo_ch)
+                mn = servo_output_min.get(servo_ch)
+                mx = servo_output_max.get(servo_ch)
+                fn = servo_functions.get(servo_ch)
+                result.append({
+                    "id": motor_id,
+                    "servoChannel": servo_ch,
+                    "servoFunction": int(round(float(fn))) if valid_number(fn) else None,
+                    "pwm": int(round(float(pwm))) if valid_number(pwm) else None,
+                    "minPwm": int(round(float(mn))) if valid_number(mn) else None,
+                    "maxPwm": int(round(float(mx))) if valid_number(mx) else None,
+                    "mappingSource": source,
+                })
+            return result
+
+        def merged_motor_snapshot():
+            outputs = {x["id"]: x for x in motor_output_snapshot()}
+            result = []
+            for i in range(MOTOR_COUNT):
+                motor_id = i + 1
+                out = outputs.get(motor_id, {})
+                result.append({
+                    "id": motor_id,
+                    "servoChannel": out.get("servoChannel"),
+                    "servoFunction": out.get("servoFunction"),
+                    "mappingSource": out.get("mappingSource"),
+                    "pwm": out.get("pwm"),
+                    "minPwm": out.get("minPwm"),
+                    "maxPwm": out.get("maxPwm"),
+                    "rpm": int(round(esc_rpm_current[i])) if valid_number(esc_rpm_current[i]) else None,
+                    "maxRpm": int(round(esc_rpm_max[i])) if valid_number(esc_rpm_max[i]) else None,
+                    "escTemp": round(esc_temp_current[i], 1) if valid_number(esc_temp_current[i]) else None,
+                    "escCurrent": round(esc_current_current[i], 1) if valid_number(esc_current_current[i]) else None,
+                })
+            return result
+
         # V19 compatibility wrappers.
         def throttle_calibration():
             return control_calibration(3)
@@ -3388,6 +3455,8 @@ async def analyze(file: UploadFile = File(...)):
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "throttle": throttle_snapshot(),
                     "controls": controls_snapshot(),
+                    "motorOutputs": motor_output_snapshot(),
+                    "motors": merged_motor_snapshot(),
                     # Raw ArduPilot STATUSTEXT stays in "system_text".
                     # Our own calculated/synthetic events go to "analysis_text".
                     "system_text": (
@@ -3447,6 +3516,8 @@ async def analyze(file: UploadFile = File(...)):
                     "verticalSpeedDown": round(curr_vertical_speed_down, 2) if valid_number(curr_vertical_speed_down) else None,
                     "throttle": throttle_snapshot(),
                     "controls": controls_snapshot(),
+                    "motorOutputs": motor_output_snapshot(),
+                    "motors": merged_motor_snapshot(),
                     "system_text": "",
                     "analysis_text": "",
                     "pilot_text": "",
@@ -3867,6 +3938,12 @@ async def analyze(file: UploadFile = File(...)):
                             if param_id in rc_axis_cal[ch_num]:
                                 rc_axis_cal[ch_num][param_id] = float(value)
                                 break
+
+                        servo_fn_match = re.fullmatch(r"SERVO(\d+)_FUNCTION", param_id)
+                        if servo_fn_match:
+                            servo_ch = int(servo_fn_match.group(1))
+                            if 1 <= servo_ch <= 16:
+                                servo_functions[servo_ch] = int(round(float(value)))
                 except Exception:
                     pass
 
@@ -4084,7 +4161,7 @@ async def analyze(file: UploadFile = File(...)):
                             val,
                         )
 
-                # V20 — update all four primary control axes and their maximum deflection.
+                # V21 — update all four primary control axes and their maximum deflection.
                 for control_ch in range(1, 5):
                     control_val = channels.get(control_ch, 0)
                     if valid_number(control_val) and 800 < float(control_val) < 2200:
@@ -4336,18 +4413,46 @@ async def analyze(file: UploadFile = File(...)):
 
                     active_emergency_attempt = None
 
-            # SERVO OUTPUTS — V18 correlation with the configured actuator output.
+            # SERVO OUTPUTS — output COMMAND in microseconds, not RPM.
+            # MAVLink1 can send separate 8-output ports; MAVLink2 may expose extension
+            # fields servo9_raw..servo16_raw.  Resolve both layouts conservatively.
             elif msg_type == "SERVO_OUTPUT_RAW":
-                for servo_num in range(1, 17):
-                    val = getattr(msg, f"servo{servo_num}_raw", None)
+                try:
+                    port = int(getattr(msg, "port", 0) or 0)
+                except Exception:
+                    port = 0
+
+                extension_present = False
+                for field_num in range(9, 17):
+                    ext = getattr(msg, f"servo{field_num}_raw", None)
+                    if valid_number(ext) and 500 <= float(ext) <= 2500:
+                        extension_present = True
+                        break
+
+                for field_num in range(1, 17):
+                    val = getattr(msg, f"servo{field_num}_raw", None)
                     if not valid_number(val):
                         continue
                     val = int(round(float(val)))
                     if not 500 <= val <= 2500:
                         continue
 
+                    # Old split-port layout: port 1 fields 1..8 are outputs 9..16.
+                    if field_num <= 8 and port > 0 and not extension_present:
+                        servo_num = port * 8 + field_num
+                    else:
+                        servo_num = field_num
+
+                    if not 1 <= servo_num <= 16:
+                        continue
+
                     prev = servo_output_last.get(servo_num)
                     servo_output_last[servo_num] = val
+                    servo_output_current[servo_num] = val
+                    if servo_output_min[servo_num] is None or val < servo_output_min[servo_num]:
+                        servo_output_min[servo_num] = val
+                    if servo_output_max[servo_num] is None or val > servo_output_max[servo_num]:
+                        servo_output_max[servo_num] = val
 
                     if prev is None or abs(val - prev) < PAYLOAD_SERVO_DELTA_US:
                         continue
@@ -5343,6 +5448,8 @@ async def analyze(file: UploadFile = File(...)):
                     "verticalSpeedDown": ev.get("verticalSpeedDown"),
                     "throttle": ev.get("throttle"),
                     "controls": ev.get("controls"),
+                    "motorOutputs": ev.get("motorOutputs", []),
+                    "motors": ev.get("motors", []),
                     "flightNumber": ev.get("flightNumber"),
                     "takeoffEpisodeNumber": ev.get("takeoffEpisodeNumber"),
                     "systemText": ev.get("system_text", ""),
@@ -7301,6 +7408,20 @@ async def analyze(file: UploadFile = File(...)):
                     }
                     for i in range(4)
                 ],
+            },
+            "motors": {
+                "count": MOTOR_COUNT,
+                "items": merged_motor_snapshot(),
+                "pwmSource": "SERVO_OUTPUT_RAW (microseconds)",
+                "rpmSource": "ESC_TELEMETRY_1_TO_4.rpm (reported by ArduPilot)",
+                "rpmConversionApplied": False,
+                "note": (
+                    "PWM and RPM are independent values. No automatic pole-count/eRPM conversion is applied."
+                ),
+                "servoFunctions": {
+                    str(ch): int(round(float(fn))) if valid_number(fn) else None
+                    for ch, fn in servo_functions.items()
+                },
             },
             "controls": {
                 "deadbandUs": CONTROL_CENTER_DEADBAND_US,
