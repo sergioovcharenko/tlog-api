@@ -1,3 +1,4 @@
+# V22: UI-normalized Timeline pair; backend logic inherited from V21.
 
 import math
 import os
