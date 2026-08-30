@@ -111,6 +111,29 @@ ANTENNA_DBM_WORSEN_MIN_FRACTION = 0.60
 CH7_REVERSED = False
 CH8_REVERSED = False
 
+# V18 — TX16S switch diagnostics.
+# Mapping inferred from the supplied TLOGs / current setup.
+# Change only these four channel numbers if the EdgeTX mixer is remapped.
+TX16_SWITCH_CHANNELS = {
+    "SC": 7,   # 3-pos: away=safety, middle=right mechanism, toward=left mechanism
+    "SD": 8,   # 3-pos: only toward removes Emergency STOP safety
+    "SF": 10,  # 2-pos activator, active at high PWM
+    "SH": 6,   # momentary Emergency STOP command, active at high PWM
+}
+TX16_ACTIVE_PWM_MIN = 1700
+TX16_INACTIVE_PWM_MAX = 1300
+
+# Payload-actuator diagnostics. This does NOT prove mechanical movement;
+# it confirms that the autopilot changed the configured PWM output.
+PAYLOAD_CONFIRM_SERVO = 7
+PAYLOAD_SERVO_DELTA_US = 250
+PAYLOAD_SERVO_CORRELATION_SEC = 3.0
+
+# Emergency STOP diagnostic rule supplied by the user.
+EMERGENCY_STOP_MIN_HOLD_SEC = 8.0
+EMERGENCY_STOP_EXPECTED_HOLD_SEC = 10.0
+EMERGENCY_DISARM_CORRELATION_SEC = 3.0
+
 VTX_CHANNELS = {
     1: {1: 5180, 2: 5240, 3: 5300},
     2: {1: 5520, 2: 5580, 3: 5640},
@@ -2933,6 +2956,18 @@ async def analyze(file: UploadFile = File(...)):
         last_rc_state = {i: 0 for i in range(1, 19)}
         max_throttle = 0
 
+        # V18 — TX16S named-switch diagnostics.
+        tx16_switch_pwm = {"SC": None, "SD": None, "SF": None, "SH": None}
+        tx16_switch_state = {"SC": None, "SD": None, "SF": None, "SH": None}
+        payload_commands = []
+        pending_payload_command = None
+        servo_output_last = {i: None for i in range(1, 17)}
+        servo_output_events = []
+
+        emergency_stop_attempts = []
+        active_emergency_attempt = None
+        emergency_stop_confirmed_count = 0
+
         # Battery
         min_voltage = 999.0
         max_current = 0.0
@@ -3346,6 +3381,52 @@ async def analyze(file: UploadFile = File(...)):
                     "VIDEO",
                 )
 
+        def tx16_three_pos_label(switch_name, pwm):
+            pos = three_position_switch(pwm)
+            if pos is None:
+                return None
+
+            if switch_name == "SC":
+                return {
+                    1: "ВІД СЕБЕ — запобіжник",
+                    2: "СЕРЕДНЄ — правий механізм",
+                    3: "ДО СЕБЕ — лівий механізм",
+                }[pos]
+
+            if switch_name == "SD":
+                return {
+                    1: "ВІД СЕБЕ — запобіжник",
+                    2: "СЕРЕДНЄ — запобіжник",
+                    3: "ДО СЕБЕ — запобіжник знято",
+                }[pos]
+
+            return f"ПОЗИЦІЯ {pos}"
+
+        def tx16_two_pos_active(pwm):
+            if not valid_number(pwm):
+                return None
+            pwm = float(pwm)
+            if not 800 < pwm < 2200:
+                return None
+            if pwm >= TX16_ACTIVE_PWM_MIN:
+                return True
+            if pwm <= TX16_INACTIVE_PWM_MAX:
+                return False
+            return None
+
+        def tx16_state_text(name, pwm):
+            if name in ("SC", "SD"):
+                return tx16_three_pos_label(name, pwm)
+
+            active = tx16_two_pos_active(pwm)
+            if active is None:
+                return None
+            if name == "SF":
+                return "АКТИВАТОР УВІМКНЕНО" if active else "активатор вимкнено"
+            if name == "SH":
+                return "EMERGENCY STOP УТРИМУЄТЬСЯ" if active else "Emergency STOP відпущено"
+            return "активно" if active else "неактивно"
+
         def process_complete_statustext(full_txt, severity, timestamp, mode):
             nonlocal rangefinder_failed_flag
             nonlocal optical_zero_detected, optical_zero_timestamp, optical_zero_text
@@ -3511,6 +3592,7 @@ async def analyze(file: UploadFile = File(...)):
             "TEMPERATURE", "HIGHRES_IMU", "SCALED_PRESSURE",
             "SCALED_PRESSURE2", "SCALED_PRESSURE3", "MCU_STATUS",
             "STATUSTEXT", "ESC_TELEMETRY_1_TO_4", "PARAM_VALUE",
+            "SERVO_OUTPUT_RAW",
         ]
 
         while True:
@@ -3617,6 +3699,31 @@ async def analyze(file: UploadFile = File(...)):
                             current_timestamp,
                             current_mode,
                         )
+
+                        # V18 — confirm Emergency STOP only when a valid SD+SH
+                        # hold preceded DISARM. This distinguishes an operator
+                        # Emergency STOP sequence from an ordinary DISARM.
+                        if active_emergency_attempt is not None:
+                            hold_duration = max(
+                                0.0,
+                                current_timestamp - active_emergency_attempt["startTimestamp"],
+                            )
+                            if hold_duration >= EMERGENCY_STOP_MIN_HOLD_SEC:
+                                active_emergency_attempt["durationSec"] = round(hold_duration, 3)
+                                active_emergency_attempt["thresholdReached"] = True
+                                active_emergency_attempt["confirmedByDisarm"] = True
+                                active_emergency_attempt["disarmTimestamp"] = current_timestamp
+                                active_emergency_attempt["status"] = "CONFIRMED_DISARM"
+                                emergency_stop_confirmed_count += 1
+                                add_event(
+                                    f"🛑 EMERGENCY STOP ПІДТВЕРДЖЕНО: "
+                                    f"SH утримувався {hold_duration:.1f} с → DISARM",
+                                    current_timestamp,
+                                    current_mode,
+                                    True,
+                                    False,
+                                    "EMERGENCY_STOP",
+                                )
 
                         was_armed = False
 
@@ -3852,6 +3959,7 @@ async def analyze(file: UploadFile = File(...)):
                             val,
                         )
 
+                # Existing VTX logic remains unchanged.
                 ch7 = channels.get(7, 0)
                 ch8 = channels.get(8, 0)
 
@@ -3865,7 +3973,8 @@ async def analyze(file: UploadFile = File(...)):
                         current_timestamp,
                     )
 
-                for ch_num in range(5, 9):
+                # Existing generic pilot-channel events, extended through CH12.
+                for ch_num in range(5, 13):
                     val = channels.get(
                         ch_num,
                         0,
@@ -3896,6 +4005,240 @@ async def analyze(file: UploadFile = File(...)):
                         )
 
                     last_rc_state[ch_num] = val
+
+                # ----------------------------------------------------
+                # V18 — named TX16S switches: SC / SD / SF / SH
+                # ----------------------------------------------------
+                named_pwm = {
+                    name: channels.get(ch_num, 0)
+                    for name, ch_num in TX16_SWITCH_CHANNELS.items()
+                }
+
+                previous_named_state = dict(tx16_switch_state)
+
+                for name, pwm in named_pwm.items():
+                    if valid_number(pwm) and 800 < float(pwm) < 2200:
+                        tx16_switch_pwm[name] = int(round(float(pwm)))
+                        new_state = tx16_state_text(name, pwm)
+
+                        if (
+                            new_state is not None
+                            and tx16_switch_state.get(name) is not None
+                            and new_state != tx16_switch_state.get(name)
+                        ):
+                            add_event(
+                                f"🎛️ {name}: {new_state} ({int(round(float(pwm)))} us)",
+                                current_timestamp,
+                                current_mode,
+                                False,
+                                True,
+                                "TX16_SWITCH",
+                            )
+
+                        if new_state is not None:
+                            tx16_switch_state[name] = new_state
+
+                sc_pos = three_position_switch(named_pwm.get("SC", 0))
+                sd_pos = three_position_switch(named_pwm.get("SD", 0))
+                sf_active = tx16_two_pos_active(named_pwm.get("SF", 0))
+                sh_active = tx16_two_pos_active(named_pwm.get("SH", 0))
+
+                prev_sf_active = None
+                prev_sh_active = None
+                if previous_named_state.get("SF") is not None:
+                    prev_sf_active = "УВІМКНЕНО" in previous_named_state["SF"]
+                if previous_named_state.get("SH") is not None:
+                    prev_sh_active = "УТРИМУЄТЬСЯ" in previous_named_state["SH"]
+
+                # SC + SF: detect the operator command. Mechanical movement is
+                # confirmed separately below by the SERVO_OUTPUT_RAW response.
+                if sf_active is True and prev_sf_active is False:
+                    if sc_pos in (2, 3):
+                        mechanism = "RIGHT" if sc_pos == 2 else "LEFT"
+                        mechanism_ua = "правий" if sc_pos == 2 else "лівий"
+                        command = {
+                            "timestamp": current_timestamp,
+                            "scPosition": sc_pos,
+                            "mechanism": mechanism,
+                            "sfPwm": tx16_switch_pwm.get("SF"),
+                            "scPwm": tx16_switch_pwm.get("SC"),
+                            "confirmedByServo": False,
+                            "servo": PAYLOAD_CONFIRM_SERVO,
+                            "servoTimestamp": None,
+                            "servoFrom": None,
+                            "servoTo": None,
+                        }
+                        payload_commands.append(command)
+                        pending_payload_command = command
+                        add_event(
+                            f"📦 Команда виконавчого механізму: {mechanism_ua}; "
+                            f"SC={sc_pos}, SF=активовано",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            True,
+                            "PAYLOAD_COMMAND",
+                        )
+                    elif sc_pos == 1:
+                        add_event(
+                            "🔒 SF активовано, але SC залишається на запобіжнику — "
+                            "команда виконавчого механізму заблокована",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            True,
+                            "PAYLOAD_BLOCKED",
+                        )
+
+                # SD + SH: Emergency STOP hold logic.
+                if sh_active is True and prev_sh_active is False:
+                    if sd_pos == 3:
+                        attempt = {
+                            "startTimestamp": current_timestamp,
+                            "endTimestamp": None,
+                            "durationSec": 0.0,
+                            "thresholdReached": False,
+                            "confirmedByDisarm": False,
+                            "disarmTimestamp": None,
+                            "status": "HOLDING",
+                        }
+                        emergency_stop_attempts.append(attempt)
+                        active_emergency_attempt = attempt
+                        add_event(
+                            "🛑 Emergency STOP: SD до себе, SH активовано — "
+                            "початок відліку утримання",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            True,
+                            "EMERGENCY_STOP_HOLD",
+                        )
+                    else:
+                        add_event(
+                            "🔒 SH активовано, але SD на запобіжнику — "
+                            "Emergency STOP заблокований",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            True,
+                            "EMERGENCY_STOP_BLOCKED",
+                        )
+
+                # While SH is held, emit one exact event when the minimum
+                # 8-second condition is reached.
+                if (
+                    active_emergency_attempt is not None
+                    and sh_active is True
+                    and sd_pos == 3
+                    and not active_emergency_attempt.get("thresholdReached")
+                ):
+                    held = current_timestamp - active_emergency_attempt["startTimestamp"]
+                    if held >= EMERGENCY_STOP_MIN_HOLD_SEC:
+                        active_emergency_attempt["thresholdReached"] = True
+                        active_emergency_attempt["durationSec"] = round(held, 3)
+                        active_emergency_attempt["status"] = "THRESHOLD_REACHED"
+                        add_event(
+                            f"🛑 Emergency STOP: SH утримується {held:.1f} с — "
+                            f"мінімальний поріг {EMERGENCY_STOP_MIN_HOLD_SEC:.0f} с досягнуто",
+                            current_timestamp,
+                            current_mode,
+                            True,
+                            False,
+                            "EMERGENCY_STOP",
+                        )
+
+                # SH release or SD returned to safety ends an active attempt.
+                stop_holding = (
+                    active_emergency_attempt is not None
+                    and (sh_active is False or sd_pos != 3)
+                )
+                if stop_holding:
+                    held = max(
+                        0.0,
+                        current_timestamp - active_emergency_attempt["startTimestamp"],
+                    )
+                    active_emergency_attempt["endTimestamp"] = current_timestamp
+                    active_emergency_attempt["durationSec"] = round(held, 3)
+
+                    if active_emergency_attempt.get("confirmedByDisarm"):
+                        active_emergency_attempt["status"] = "CONFIRMED_DISARM"
+                    elif held >= EMERGENCY_STOP_MIN_HOLD_SEC:
+                        active_emergency_attempt["thresholdReached"] = True
+                        active_emergency_attempt["status"] = "COMPLETED_NO_DISARM"
+                        add_event(
+                            f"🛑 Emergency STOP: SH відпущено після {held:.1f} с; "
+                            "умова витримки виконана, але DISARM у цей момент не підтверджено",
+                            current_timestamp,
+                            current_mode,
+                            True,
+                            False,
+                            "EMERGENCY_STOP",
+                        )
+                    else:
+                        active_emergency_attempt["status"] = "CANCELLED_SHORT_HOLD"
+                        add_event(
+                            f"ℹ️ Emergency STOP не завершено: SH утримувався "
+                            f"лише {held:.1f} с (< {EMERGENCY_STOP_MIN_HOLD_SEC:.0f} с)",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            False,
+                            "EMERGENCY_STOP_ATTEMPT",
+                        )
+
+                    active_emergency_attempt = None
+
+            # SERVO OUTPUTS — V18 correlation with the configured actuator output.
+            elif msg_type == "SERVO_OUTPUT_RAW":
+                for servo_num in range(1, 17):
+                    val = getattr(msg, f"servo{servo_num}_raw", None)
+                    if not valid_number(val):
+                        continue
+                    val = int(round(float(val)))
+                    if not 500 <= val <= 2500:
+                        continue
+
+                    prev = servo_output_last.get(servo_num)
+                    servo_output_last[servo_num] = val
+
+                    if prev is None or abs(val - prev) < PAYLOAD_SERVO_DELTA_US:
+                        continue
+
+                    out_event = {
+                        "timestamp": current_timestamp,
+                        "servo": servo_num,
+                        "from": prev,
+                        "to": val,
+                    }
+                    servo_output_events.append(out_event)
+
+                    if servo_num == PAYLOAD_CONFIRM_SERVO:
+                        add_event(
+                            f"⚙️ SERVO{servo_num}: {prev} → {val} us",
+                            current_timestamp,
+                            current_mode,
+                            False,
+                            False,
+                            "SERVO_OUTPUT",
+                        )
+
+                        if pending_payload_command is not None:
+                            dt = current_timestamp - pending_payload_command["timestamp"]
+                            if 0.0 <= dt <= PAYLOAD_SERVO_CORRELATION_SEC:
+                                pending_payload_command["confirmedByServo"] = True
+                                pending_payload_command["servoTimestamp"] = current_timestamp
+                                pending_payload_command["servoFrom"] = prev
+                                pending_payload_command["servoTo"] = val
+                                add_event(
+                                    f"✅ Команду виконавчого механізму підтверджено виходом "
+                                    f"SERVO{servo_num}: {prev} → {val} us",
+                                    current_timestamp,
+                                    current_mode,
+                                    False,
+                                    False,
+                                    "PAYLOAD_CONFIRM",
+                                )
+                                pending_payload_command = None
 
             # RADIO
             elif msg_type in ["RADIO", "RADIO_STATUS"]:
@@ -4905,6 +5248,57 @@ async def analyze(file: UploadFile = File(...)):
         accelerometer_calibration_session = bool(
             ground_session and accel_calibration_events
         )
+
+        # V18 — TX16S operator-action summary.
+        if payload_commands:
+            confirmed_payload = sum(1 for x in payload_commands if x.get("confirmedByServo"))
+            first_payload_time = format_timeline_time(payload_commands[0]["timestamp"], base_t)
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{first_payload_time}">'
+                f"📦 <b>Виконавчий механізм:</b> зафіксовано {len(payload_commands)} "
+                f"команд(и) SC+SF; підтверджено зміною SERVO{PAYLOAD_CONFIRM_SERVO}: "
+                f"{confirmed_payload}. Натисніть, щоб перейти до першої команди.</span>"
+            )
+
+        if emergency_stop_attempts:
+            confirmed_emergency = [
+                x for x in emergency_stop_attempts if x.get("confirmedByDisarm")
+            ]
+            threshold_emergency = [
+                x for x in emergency_stop_attempts if x.get("thresholdReached")
+            ]
+            short_emergency = [
+                x for x in emergency_stop_attempts
+                if x.get("status") == "CANCELLED_SHORT_HOLD"
+            ]
+            first_estop_time = format_timeline_time(
+                emergency_stop_attempts[0]["startTimestamp"],
+                base_t,
+            )
+
+            if confirmed_emergency:
+                is_critical = True
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{first_estop_time}">'
+                    f"🛑 <b>Emergency STOP:</b> підтверджено {len(confirmed_emergency)} "
+                    f"випадок(и): SD знято із запобіжника + SH ≥ "
+                    f"{EMERGENCY_STOP_MIN_HOLD_SEC:.0f} с + DISARM.</span>"
+                )
+            elif threshold_emergency:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{first_estop_time}">'
+                    f"⚠️ <b>Emergency STOP:</b> поріг утримання SH ≥ "
+                    f"{EMERGENCY_STOP_MIN_HOLD_SEC:.0f} с досягався, але DISARM "
+                    f"не підтверджено. Натисніть для перевірки Timeline.</span>"
+                )
+            elif short_emergency:
+                longest = max(float(x.get("durationSec") or 0.0) for x in short_emergency)
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{first_estop_time}">'
+                    f"ℹ️ <b>Emergency STOP:</b> були короткі спроби; "
+                    f"максимальне утримання SH {longest:.1f} с, "
+                    f"менше порога {EMERGENCY_STOP_MIN_HOLD_SEC:.0f} с.</span>"
+                )
 
         # Завершення польоту / LAND -> automatic DISARM
         if disarm_detected:
@@ -6789,6 +7183,36 @@ async def analyze(file: UploadFile = File(...)):
                     if rc_max[8] > 0
                     else "—"
                 ),
+                "ch6": (
+                    f"{rc_min[6]}–{rc_max[6]} us"
+                    if rc_max[6] > 0
+                    else "—"
+                ),
+                "ch10": (
+                    f"{rc_min[10]}–{rc_max[10]} us"
+                    if rc_max[10] > 0
+                    else "—"
+                ),
+            },
+            "tx16": {
+                "mapping": dict(TX16_SWITCH_CHANNELS),
+                "switchPwm": dict(tx16_switch_pwm),
+                "switchState": dict(tx16_switch_state),
+                "payloadCommandCount": len(payload_commands),
+                "payloadConfirmedCount": sum(
+                    1 for x in payload_commands if x.get("confirmedByServo")
+                ),
+                "payloadCommands": payload_commands,
+                "payloadConfirmServo": PAYLOAD_CONFIRM_SERVO,
+                "servoOutputEventCount": len(servo_output_events),
+                "emergencyStopAttemptCount": len(emergency_stop_attempts),
+                "emergencyStopThresholdCount": sum(
+                    1 for x in emergency_stop_attempts if x.get("thresholdReached")
+                ),
+                "emergencyStopConfirmedCount": emergency_stop_confirmed_count,
+                "emergencyStopAttempts": emergency_stop_attempts,
+                "emergencyStopMinHoldSec": EMERGENCY_STOP_MIN_HOLD_SEC,
+                "emergencyStopExpectedHoldSec": EMERGENCY_STOP_EXPECTED_HOLD_SEC,
             },
             "timeline": timeline,
         }
