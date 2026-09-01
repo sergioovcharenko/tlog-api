@@ -1035,6 +1035,73 @@ def three_position_switch(pwm, reversed_switch=False):
     return pos
 
 
+# ============================================================
+# V23.14 — TX16S SWITCH MONITORING
+# ============================================================
+# Mapping used by this analyzer. These are telemetry/display names only.
+# ============================================================
+# V23.14 — RADIO CALIBRATION DETECTION
+# ============================================================
+# Радіокалібрування визначаємо НЕ за одним повідомленням, а за характерною
+# послідовністю RC_CHANNELS на землі: осі CH1..CH4 багаторазово проходять
+# через низьке / середнє / високе положення і охоплюють майже весь PWM-діапазон.
+# Це дозволяє відрізняти калібрування від звичайного короткого руху стіком.
+RADIO_CAL_CHANNELS = (1, 2, 3, 4)
+RADIO_CAL_LOW_PWM = 1200
+RADIO_CAL_HIGH_PWM = 1800
+RADIO_CAL_MIN_SPAN_PWM = 650
+RADIO_CAL_MIN_TRANSITIONS = 10
+RADIO_CAL_MIN_DURATION_SEC = 3.0
+
+
+def radio_cal_bucket(pwm):
+    """Груба зона положення осі для виявлення проходження MIN/CENTER/MAX."""
+    if not valid_number(pwm):
+        return None
+    v = float(pwm)
+    if v <= RADIO_CAL_LOW_PWM:
+        return "LOW"
+    if v >= RADIO_CAL_HIGH_PWM:
+        return "HIGH"
+    return "MID"
+
+TX16_SWITCH_CHANNELS = {
+    "SH": 6,
+    "SC": 7,
+    "SD": 8,
+    "SF": 10,
+}
+
+def tx16_two_position_state(pwm):
+    """Return OFF/ON for a two-position RC switch, or None in transition/invalid zone."""
+    if not valid_number(pwm):
+        return None
+    pwm = float(pwm)
+    if pwm <= 1300:
+        return "OFF"
+    if pwm >= 1700:
+        return "ON"
+    return None
+
+def tx16_switch_state(name, pwm):
+    """Normalized switch state used for change detection and Timeline text."""
+    name = str(name or "").upper()
+    if name in ("SC", "SD"):
+        pos = three_position_switch(pwm)
+        return f"POS{pos}" if pos is not None else None
+    if name in ("SF", "SH"):
+        return tx16_two_position_state(pwm)
+    return None
+
+def tx16_switch_state_text(name, pwm):
+    """Human-readable neutral state label for the analyzer UI."""
+    state = tx16_switch_state(name, pwm)
+    if state is None:
+        return "ПЕРЕХІДНА ЗОНА"
+    if state.startswith("POS"):
+        return "ПОЗИЦІЯ " + state[-1]
+    return state
+
 def get_vtx_state(ch7_pwm, ch8_pwm):
     band_pos = three_position_switch(ch7_pwm, CH7_REVERSED)
     channel_pos = three_position_switch(ch8_pwm, CH8_REVERSED)
@@ -1245,6 +1312,19 @@ async def analyze(file: UploadFile = File(...)):
         # щоб Timeline міг показати положення віртуальних стіків саме в цей момент.
         curr_rc_channels = {i: None for i in range(1, 19)}
         max_throttle = 0
+
+        # V23.14 — накопичувач ознак РАДІОКАЛІБРУВАННЯ.
+        # Рахуємо лише коли борт DISARMED, щоб звичайний політ зі значними
+        # командами по стіках не помилково визначався як калібрування.
+        radio_cal_stats = {
+            ch: {"min": 9999, "max": 0, "low": False, "high": False}
+            for ch in RADIO_CAL_CHANNELS
+        }
+        radio_cal_last_bucket = {ch: None for ch in RADIO_CAL_CHANNELS}
+        radio_cal_transition_count = 0
+        radio_cal_first_activity_ts = None
+        radio_cal_last_activity_ts = None
+        radio_cal_rc_message_count = 0
 
         # Battery
         min_voltage = 999.0
@@ -2150,6 +2230,45 @@ async def analyze(file: UploadFile = File(...)):
                             val,
                         )
 
+                # ----------------------------------------------------
+                # V23.14: виявлення характерної процедури радіокалібрування.
+                # Під час калібрування оператор проводить CH1..CH4 через
+                # крайні положення. Фіксуємо повний діапазон та кількість
+                # переходів між LOW/MID/HIGH, але тільки при DISARM.
+                # ----------------------------------------------------
+                if not is_currently_armed:
+                    valid_cal_axes = 0
+                    changed_this_message = False
+
+                    for cal_ch in RADIO_CAL_CHANNELS:
+                        cal_val = channels.get(cal_ch, 0)
+                        if not valid_number(cal_val) or not 800 < float(cal_val) < 2200:
+                            continue
+
+                        valid_cal_axes += 1
+                        cal_val = int(round(float(cal_val)))
+                        st = radio_cal_stats[cal_ch]
+                        st["min"] = min(st["min"], cal_val)
+                        st["max"] = max(st["max"], cal_val)
+                        if cal_val <= RADIO_CAL_LOW_PWM:
+                            st["low"] = True
+                        if cal_val >= RADIO_CAL_HIGH_PWM:
+                            st["high"] = True
+
+                        bucket = radio_cal_bucket(cal_val)
+                        prev_bucket = radio_cal_last_bucket[cal_ch]
+                        if prev_bucket is not None and bucket != prev_bucket:
+                            radio_cal_transition_count += 1
+                            changed_this_message = True
+                        radio_cal_last_bucket[cal_ch] = bucket
+
+                    if valid_cal_axes >= 3:
+                        radio_cal_rc_message_count += 1
+                        if changed_this_message:
+                            if radio_cal_first_activity_ts is None:
+                                radio_cal_first_activity_ts = current_timestamp
+                            radio_cal_last_activity_ts = current_timestamp
+
                 ch7 = channels.get(7, 0)
                 ch8 = channels.get(8, 0)
 
@@ -2163,29 +2282,29 @@ async def analyze(file: UploadFile = File(...)):
                         current_timestamp,
                     )
 
-                for ch_num in range(5, 9):
-                    val = channels.get(
-                        ch_num,
-                        0,
-                    )
-
-                    if not 800 < val < 2200:
+                # V23.9: explicitly track SC / SD / SF / SH by interpreted state,
+                # not merely by a >250 us raw jump. This fixes missed SF (CH10)
+                # transitions and makes SC/SD changes visible by switch name.
+                for switch_name, ch_num in TX16_SWITCH_CHANNELS.items():
+                    val = channels.get(ch_num, 0)
+                    if not valid_number(val) or not 800 < float(val) < 2200:
                         continue
 
-                    prev = last_rc_state[ch_num]
+                    val = int(round(float(val)))
+                    prev_pwm = last_rc_state[ch_num]
+                    prev_state = (
+                        tx16_switch_state(switch_name, prev_pwm)
+                        if valid_number(prev_pwm) and float(prev_pwm) > 0
+                        else None
+                    )
+                    new_state = tx16_switch_state(switch_name, val)
 
-                    if prev > 0 and abs(val - prev) > 250:
-                        pos = three_position_switch(val)
-
-                        if pos == 1:
-                            state_str = "ПОЗИЦІЯ 1"
-                        elif pos == 2:
-                            state_str = "ПОЗИЦІЯ 2"
-                        else:
-                            state_str = "ПОЗИЦІЯ 3"
-
+                    # Emit an event only after the channel has been seen once and
+                    # the interpreted position/state really changed.
+                    if prev_pwm > 0 and new_state != prev_state:
                         add_event(
-                            f"🎮 CH{ch_num}: {state_str} ({val} us)",
+                            f"🎚 {switch_name} (CH{ch_num}): "
+                            f"{tx16_switch_state_text(switch_name, val)} ({val} us)",
                             current_timestamp,
                             current_mode,
                             False,
@@ -3023,6 +3142,107 @@ async def analyze(file: UploadFile = File(...)):
         flight_sessions = analyze_flight_sessions(raw_timeline, current_timestamp)
         first_flight_arm_timestamp = flight_sessions[0]["armTimestamp"] if flight_sessions else arm_timestamp
 
+        # ====================================================
+        # V23.14 — RADIO CALIBRATION RESULT
+        # ====================================================
+        radio_cal_full_axes = []
+        radio_cal_axis_ranges = {}
+        for cal_ch in RADIO_CAL_CHANNELS:
+            st = radio_cal_stats[cal_ch]
+            if st["max"] > 0 and st["min"] < 9999:
+                span = st["max"] - st["min"]
+                radio_cal_axis_ranges[cal_ch] = {
+                    "min": int(st["min"]),
+                    "max": int(st["max"]),
+                    "span": int(span),
+                    "lowSeen": bool(st["low"]),
+                    "highSeen": bool(st["high"]),
+                }
+                if st["low"] and st["high"] and span >= RADIO_CAL_MIN_SPAN_PWM:
+                    radio_cal_full_axes.append(cal_ch)
+
+        radio_cal_duration = 0.0
+        if (
+            radio_cal_first_activity_ts is not None
+            and radio_cal_last_activity_ts is not None
+        ):
+            radio_cal_duration = max(
+                0.0,
+                float(radio_cal_last_activity_ts) - float(radio_cal_first_activity_ts),
+            )
+
+        # Висока впевненість: усі 4 осі пройшли MIN/MAX.
+        # Помірний fallback: 3 осі + дуже багато переходів.
+        radio_cal_detected = bool(
+            (
+                len(radio_cal_full_axes) == 4
+                and radio_cal_transition_count >= RADIO_CAL_MIN_TRANSITIONS
+                and radio_cal_duration >= RADIO_CAL_MIN_DURATION_SEC
+            )
+            or (
+                len(radio_cal_full_axes) >= 3
+                and radio_cal_transition_count >= RADIO_CAL_MIN_TRANSITIONS + 8
+                and radio_cal_duration >= RADIO_CAL_MIN_DURATION_SEC
+            )
+        )
+
+        radio_cal_confidence = 0
+        if radio_cal_detected:
+            axis_score = min(1.0, len(radio_cal_full_axes) / 4.0)
+            transition_score = min(1.0, radio_cal_transition_count / 24.0)
+            duration_score = min(1.0, radio_cal_duration / 15.0)
+            radio_cal_confidence = int(round(100.0 * (
+                0.60 * axis_score + 0.25 * transition_score + 0.15 * duration_score
+            )))
+
+            # Додаємо дві клікабельні часові мітки у Timeline: початок / кінець.
+            existing_rows = [
+                row for row in raw_timeline
+                if row.get("timestamp") is not None
+            ]
+
+            def make_radio_cal_marker(ts, text, event_type):
+                if existing_rows:
+                    nearest = min(
+                        existing_rows,
+                        key=lambda row: abs(float(row.get("timestamp", 0.0)) - float(ts)),
+                    )
+                    marker = dict(nearest)
+                else:
+                    marker = {
+                        "timestamp": ts, "mode": "DISARMED",
+                        "alt": "0.0 м", "dist": "0.0 м", "distValue": 0.0,
+                        "azimuth": None, "positionAzimuth": None,
+                        "nedNorth": None, "nedEast": None, "nedDown": None,
+                        "rcChannels": {}, "antennaSector": None,
+                        "vtxBand": None, "vtxChannel": None, "videoFreq": None,
+                        "volt": None, "curr": None, "engineLoad": None,
+                        "rssi": None, "dbm": None, "temp": None,
+                        "esc": [], "vibration": None, "attitude": None,
+                        "rpmAnalysis": None, "verticalSpeedDown": None,
+                    }
+                marker.update({
+                    "timestamp": ts,
+                    "system_text": "",
+                    "analysis_text": text,
+                    "pilot_text": "",
+                    "isError": False,
+                    "eventType": event_type,
+                })
+                raw_timeline.append(marker)
+
+            make_radio_cal_marker(
+                radio_cal_first_activity_ts,
+                "🎮 РАДІОКАЛІБРУВАННЯ: початок проходження стіків по діапазонах",
+                "RADIO_CALIBRATION_START",
+            )
+            make_radio_cal_marker(
+                radio_cal_last_activity_ts,
+                "✅ РАДІОКАЛІБРУВАННЯ: завершення активного проходження стіків",
+                "RADIO_CALIBRATION_END",
+            )
+            raw_timeline.sort(key=lambda row: row.get("timestamp", 0.0))
+
         # Add derived Timeline markers for accelerometer calibration.
         # IMPORTANT: clone the nearest already-valid timeline row so every field
         # expected by the serializer is present. This avoids HTTP 500/KeyError.
@@ -3237,6 +3457,36 @@ async def analyze(file: UploadFile = File(...)):
                         f"{ep_t}{endtxt}; MAX ALT епізоду {float(ep.get('maxAltitude') or 0):.1f} м. "
                         "Натисніть, щоб перейти до рядка Timeline.</span>"
                     )
+        # V23.14 — окремий AI-висновок про проведення радіокалібрування.
+        if radio_cal_detected:
+            rc_start = format_timeline_time(radio_cal_first_activity_ts, base_t)
+            rc_end = format_timeline_time(radio_cal_last_activity_ts, base_t)
+            axes_text = ", ".join(f"CH{ch}" for ch in radio_cal_full_axes)
+            ranges_text = "; ".join(
+                f"CH{ch} {radio_cal_axis_ranges[ch]['min']}–{radio_cal_axis_ranges[ch]['max']} us"
+                for ch in sorted(radio_cal_axis_ranges)
+            )
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{rc_start}">'
+                "🎮 <b>ВИЯВЛЕНО ПРОВЕДЕННЯ РАДІОКАЛІБРУВАННЯ TX16S / RC.</b> "
+                f"Активне проходження каналів: {rc_start} → {rc_end} "
+                f"({radio_cal_duration:.1f} с). Повний MIN/MAX підтверджено для: "
+                f"{axes_text or '—'}. Переходів між зонами стіків: "
+                f"{radio_cal_transition_count}. Впевненість: {radio_cal_confidence}%. "
+                f"Діапазони: {ranges_text}. "
+                "Великі відхилення CH1–CH4 у цьому інтервалі є очікуваними для "
+                "процедури калібрування і не трактуються самі по собі як хибні команди. "
+                "Натисніть, щоб перейти до початку радіокалібрування."
+                "</span>"
+            )
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{rc_end}">'
+                "✅ <b>Завершення радіокалібрування:</b> "
+                f"остання активна зміна RC зафіксована о {rc_end}. "
+                "Натисніть, щоб перейти до цього рядка Timeline."
+                "</span>"
+            )
+
         # Ground / accelerometer calibration context.
 
         if accel_calibration_events:
@@ -4040,6 +4290,17 @@ async def analyze(file: UploadFile = File(...)):
                 "rpmDropEventCount": len(rpm_drop_events),
                 "potentialThrustLossCount": len(potential_thrust_loss_events),
                 "flightSessionCount": len(flight_sessions),
+                "radioCalibration": {
+                    "detected": radio_cal_detected,
+                    "confidence": radio_cal_confidence,
+                    "startTimestamp": radio_cal_first_activity_ts,
+                    "endTimestamp": radio_cal_last_activity_ts,
+                    "durationSec": round(radio_cal_duration, 2),
+                    "transitionCount": radio_cal_transition_count,
+                    "fullRangeChannels": radio_cal_full_axes,
+                    "axisRanges": radio_cal_axis_ranges,
+                    "rcMessageCount": radio_cal_rc_message_count,
+                },
                 "accelCalibration": {
                     "detected": bool(accel_calibration_events),
                     "success": accel_calibration_success,
@@ -4171,6 +4432,19 @@ async def analyze(file: UploadFile = File(...)):
                     if rc_max[10] > 0
                     else "—"
                 ),
+            },
+            # V23.9: final/current TX16S switch states for the summary cards.
+            "tx16Switches": {
+                name: {
+                    "channel": ch_num,
+                    "pwm": curr_rc_channels.get(ch_num),
+                    "state": tx16_switch_state_text(
+                        name, curr_rc_channels.get(ch_num)
+                    ) if curr_rc_channels.get(ch_num) is not None else "—",
+                    "minPwm": rc_min[ch_num] if rc_max[ch_num] > 0 else None,
+                    "maxPwm": rc_max[ch_num] if rc_max[ch_num] > 0 else None,
+                }
+                for name, ch_num in TX16_SWITCH_CHANNELS.items()
             },
             "timeline": timeline,
         }
