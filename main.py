@@ -17,8 +17,13 @@ import os
 import tempfile
 import re
 import statistics
+import threading
+import time
+import webbrowser
+from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import FileResponse
 from pymavlink import mavutil
 
 app = FastAPI()
@@ -1190,10 +1195,16 @@ def format_ned(coords):
 # HEALTH
 # ============================================================
 
-@app.get("/")
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "mode": "offline", "version": "V24"}
+
+
+@app.get("/", include_in_schema=False)
+def offline_index():
+    """Serve the local analyzer UI from the same folder."""
+    index_path = Path(__file__).resolve().parent / "index.html"
+    return FileResponse(index_path, media_type="text/html; charset=utf-8")
 
 
 # ============================================================
@@ -4455,3 +4466,18 @@ async def analyze(file: UploadFile = File(...)):
                 os.unlink(temp.name)
             except Exception:
                 pass
+
+# ============================================================
+# OFFLINE V24 LAUNCHER
+# ============================================================
+def _open_browser():
+    """Open the local UI shortly after Uvicorn starts."""
+    time.sleep(1.2)
+    webbrowser.open("http://127.0.0.1:8765/")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="warning")
