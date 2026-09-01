@@ -7,7 +7,7 @@
 #    фактичний напрямок LOCAL_POSITION_NED (flight corridor), а dBm є перевіркою.
 # 2) Якщо траєкторія не є прямолінійною — використовується попередня оцінка
 #    POSITION_NED + dBm; Heading лишається лише резервною евристикою.
-# 3) RC_CHANNELS CH1..CH4 зберігаються у кожному SNAPSHOT для випадаючих
+# 3) RC_CHANNELS CH1..CH18 зберігаються у кожному SNAPSHOT для випадаючих
 #    віртуальних стіків TX16S у Timeline.
 # ============================================================
 
@@ -4149,6 +4149,13 @@ async def analyze(file: UploadFile = File(...)):
                     if rc_max[4] > 0
                     else "—"
                 ),
+                # V23.8: TX16S switch mapping from this aircraft setup:
+                # SH -> CH6, SC -> CH7, SD -> CH8, SF -> CH10.
+                "ch6": (
+                    f"{rc_min[6]}–{rc_max[6]} us"
+                    if rc_max[6] > 0
+                    else "—"
+                ),
                 "ch7": (
                     f"{rc_min[7]}–{rc_max[7]} us"
                     if rc_max[7] > 0
@@ -4157,6 +4164,11 @@ async def analyze(file: UploadFile = File(...)):
                 "ch8": (
                     f"{rc_min[8]}–{rc_max[8]} us"
                     if rc_max[8] > 0
+                    else "—"
+                ),
+                "ch10": (
+                    f"{rc_min[10]}–{rc_max[10]} us"
+                    if rc_max[10] > 0
                     else "—"
                 ),
             },
