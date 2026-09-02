@@ -1,4 +1,5 @@
-# V23.23 — Possible shootdown (careful TLOG-only inference) + clickable critical rows
+# V23.26 — power-priority diagnostics + exact per-flight battery statistics
+# V23.27 — competing-cause logic: possible external impact remains visible even with power collapse
 # ============================================================
 # TLOG ANALYZER V23
 #
@@ -837,8 +838,15 @@ def analyze_antenna_direction(raw_timeline, arm_timestamp):
     return result
 
 
-def analyze_flight_sessions(raw_timeline, log_end_timestamp=None):
-    """One flight = ARM->DISARM. Re-takeoff without DISARM stays in same flight."""
+def analyze_flight_sessions(raw_timeline, log_end_timestamp=None, battery_voltage_samples=None, battery_current_samples=None):
+    """One flight = ARM->DISARM. Re-takeoff without DISARM stays in same flight.
+
+    V23.26: min/max battery values are calculated from every armed SYS_STATUS
+    sample, not only from sparse Timeline snapshots. This keeps the flight card
+    consistent with the global battery summary.
+    """
+    battery_voltage_samples = battery_voltage_samples or []
+    battery_current_samples = battery_current_samples or []
     events=sorted([e for e in raw_timeline if e.get("timestamp") is not None],
                   key=lambda e:e["timestamp"])
     sessions=[]
@@ -891,6 +899,27 @@ def analyze_flight_sessions(raw_timeline, log_end_timestamp=None):
             if isinstance(att,dict):
                 vals=[abs(float(att[k])) for k in ("roll","pitch") if valid_number(att.get(k))]
                 if vals:s["maxTilt"]=max(s["maxTilt"],max(vals))
+
+        # Exact SYS_STATUS battery samples for this ARM->end interval.
+        session_voltages = [
+            float(v) for ts, v in battery_voltage_samples
+            if ts >= s["armTimestamp"]
+            and (s["endTimestamp"] is None or ts <= s["endTimestamp"])
+            and valid_number(v) and float(v) > 0
+        ]
+        if session_voltages:
+            exact_min = min(session_voltages)
+            if s["minVoltage"] is None or exact_min < s["minVoltage"]:
+                s["minVoltage"] = exact_min
+
+        session_currents = [
+            float(v) for ts, v in battery_current_samples
+            if ts >= s["armTimestamp"]
+            and (s["endTimestamp"] is None or ts <= s["endTimestamp"])
+            and valid_number(v) and float(v) >= 0
+        ]
+        if session_currents:
+            s["maxCurrent"] = max(s["maxCurrent"], max(session_currents))
 
         airborne=False
         take_candidate=None
@@ -1343,6 +1372,10 @@ async def analyze(file: UploadFile = File(...)):
         start_voltage = None
         arm_voltage = None
         reboot_or_second_battery = False
+        # V23.26: every armed SYS_STATUS sample is retained for exact
+        # per-flight battery statistics (not displayed as extra Timeline rows).
+        battery_voltage_samples = []
+        battery_current_samples = []
 
         # Health
         max_vib_x = 0.0
@@ -2055,12 +2088,14 @@ async def analyze(file: UploadFile = File(...)):
 
                     if is_currently_armed:
                         min_voltage = min(min_voltage, volt)
+                        battery_voltage_samples.append((current_timestamp, volt))
 
                 if curr >= 0:
                     curr_amp = curr
 
                     if is_currently_armed:
                         max_current = max(max_current, curr)
+                        battery_current_samples.append((current_timestamp, curr))
 
                 # Повертаємо твою стару логіку "якості оптичної навігації"
                 if current_mode == "LOITER":
@@ -3150,7 +3185,12 @@ async def analyze(file: UploadFile = File(...)):
                     curr_vertical_speed_down = old_vz
 
         # Detect all ARM->DISARM sessions in this TLOG.
-        flight_sessions = analyze_flight_sessions(raw_timeline, current_timestamp)
+        flight_sessions = analyze_flight_sessions(
+            raw_timeline,
+            current_timestamp,
+            battery_voltage_samples=battery_voltage_samples,
+            battery_current_samples=battery_current_samples,
+        )
         first_flight_arm_timestamp = flight_sessions[0]["armTimestamp"] if flight_sessions else arm_timestamp
 
         # ====================================================
@@ -3798,6 +3838,66 @@ async def analyze(file: UploadFile = File(...)):
                 f"максимальне споживання {round(max_current, 1)} A."
             )
 
+        # V23.26 — PRIORITY CAUSE: severe 6S power collapse.
+        # This has higher diagnostic priority than an RPM-only/external-impact
+        # hypothesis. TLOG can show symptoms, but cannot prove an external cause.
+        voltage_sag = max(0.0, (arm_voltage or 0.0) - (min_voltage or 0.0))
+        severe_power_collapse = bool(
+            ever_armed
+            and min_voltage > 0
+            and (
+                min_voltage <= 15.0
+                or (arm_voltage and arm_voltage > 0 and voltage_sag >= 7.0)
+            )
+        )
+        power_with_thrust_loss = bool(
+            severe_power_collapse
+            and (potential_thrust_loss_events or rpm_drop_events)
+        )
+
+        if power_with_thrust_loss:
+            is_critical = True
+            power_jump_ts = None
+            if potential_thrust_loss_events:
+                power_jump_ts = potential_thrust_loss_events[0].get("timestamp")
+            elif rpm_drop_events:
+                power_jump_ts = rpm_drop_events[0].get("timestamp")
+            power_jump_time = format_timeline_time(power_jump_ts, base_t) if power_jump_ts is not None else None
+            thrust_text = ""
+            if potential_thrust_loss_events:
+                motors = sorted({
+                    e.get("motor") for e in potential_thrust_loss_events
+                    if e.get("motor") is not None
+                })
+                if motors:
+                    thrust_text = f" Зафіксовано Potential Thrust Loss для Motor {','.join(map(str, motors))}."
+                else:
+                    thrust_text = " Зафіксовано Potential Thrust Loss."
+            rpm_text = ""
+            if rpm_drop_events:
+                strongest = max(rpm_drop_events, key=lambda e: e.get("differencePct", 0.0))
+                rpm_text = f" Максимальна асиметрія RPM: {strongest.get('differencePct', 0.0):.1f}%."
+            body = (
+                "🔴 <b>Критична проблема живлення / втрата тяги — ЗАФІКСОВАНО:</b> "
+                f"напруга під час ARMED впала до {min_voltage:.2f} V"
+                + (f" (просадка від ARM приблизно {voltage_sag:.2f} V)" if arm_voltage else "")
+                + f", піковий струм {max_current:.1f} A."
+                + thrust_text
+                + rpm_text
+                + " Ця картина підтверджує критичне просідання живлення та/або "
+                  "недостатню доступну тягу, але сама по собі не встановлює першопричину. "
+                  "Якщо одночасно присутні незалежні механічні ознаки, зовнішнє пошкодження "
+                  "залишається окремою конкурентною версією."
+            )
+            if power_jump_time:
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{power_jump_time}">'
+                    + body
+                    + " Натисніть, щоб перейти до критичної події Timeline.</span>"
+                )
+            else:
+                ai_alerts.append(body)
+
         # FC temperature
         if max_temp != -99.0:
             if max_temp >= 85.0:
@@ -4129,37 +4229,46 @@ async def analyze(file: UploadFile = File(...)):
                     + (f" для Motor {','.join(map(str, motors))}" if motors else "")
                 )
 
-            # V23.23: обережний висновок про МОЖЛИВЕ збиття.
-            # Ми НІКОЛИ не називаємо збиття підтвердженим лише за TLOG.
-            # Сильний тригер: кілька незалежних механічних ознак + лог обірвався ARMED.
-            possible_shootdown = bool(ever_armed and was_armed and impact["score"] >= 2)
+            # V23.27: do not suppress a possible external-impact hypothesis merely
+            # because voltage also collapsed. When several independent mechanical
+            # signs coincide and the TLOG ends while ARMED, show two competing causes.
+            possible_shootdown = bool(
+                ever_armed
+                and was_armed
+                and impact["score"] >= 2
+            )
 
             if possible_shootdown:
+                power_context = ""
+                if severe_power_collapse:
+                    power_context = (
+                        f" Одночасно напруга впала до {min_voltage:.2f} V. Це може бути "
+                        "окремою причиною, супутньою подією або наслідком пошкодження; "
+                        "за одним TLOG встановити напрямок причинності неможливо."
+                    )
                 ai_alerts.append(
                     f'<span class="ai-jump" data-jump-time="{impact_time}">'
-                    "⚠️ <b>Можливе збиття / зовнішній механічний вплив — НЕ ПІДТВЕРДЖЕНО:</b> "
+                    "⚠️ <b>Можливе збиття / зовнішній механічний вплив — ВИСОКА ЙМОВІРНІСТЬ, "
+                    "АЛЕ НЕ ПІДТВЕРДЖЕНО ЛИШЕ TLOG:</b> "
                     + "; ".join(features)
-                    + ". Після сукупності цих ознак TLOG завершується при ARMED без "
-                    "підтвердженого DISARM. Така послідовність може відповідати раптовому "
-                    "зовнішньому механічному впливу або пошкодженню силової установки. "
-                    "За одним TLOG неможливо встановити джерело впливу, конкретний засіб "
-                    "або підтвердити факт збиття. Натисніть, щоб перейти до найближчого "
-                    "критичного рядка Timeline."
+                    + ". Після сукупності цих незалежних ознак TLOG завершується при ARMED "
+                    "без підтвердженого DISARM. Така послідовність може відповідати "
+                    "раптовому зовнішньому механічному впливу або пошкодженню силової установки."
+                    + power_context
+                    + " За одним TLOG неможливо встановити джерело впливу, конкретний засіб "
+                      "або підтвердити факт збиття. Натисніть, щоб перейти до найближчого "
+                      "критичного рядка Timeline."
                     "</span>"
                 )
             else:
                 ai_alerts.append(
                     f'<span class="ai-jump" data-jump-time="{impact_time}">'
-                    "🧩 <b>Ознаки ймовірного зовнішнього механічного впливу "
-                    "або пошкодження силової установки:</b> "
+                    "🧩 <b>Можливе механічне пошкодження силової установки — НЕ ПІДТВЕРДЖЕНО:</b> "
                     + "; ".join(features)
-                    + ". Одночасна/близька в часі поява цих незалежних ознак "
-                    "нехарактерна для простої плавної зміни тяги. Така картина може "
-                    "відповідати контакту або удару стороннього об'єкта, потраплянню "
-                    "стороннього предмета в площину гвинтів, пошкодженню пропелера, "
-                    "двигуна чи ESC. За одним TLOG неможливо встановити конкретний "
-                    "предмет, його походження або підтвердити навмисне ураження. "
-                    "Натисніть, щоб перейти до найближчого критичного рядка Timeline."
+                    + ". Такі ознаки можуть відповідати проблемі пропелера, двигуна або ESC, "
+                    "але самі по собі не доводять зовнішній вплив. За одним TLOG неможливо "
+                    "підтвердити навмисне ураження. Натисніть, щоб перейти до найближчого "
+                    "критичного рядка Timeline."
                     "</span>"
                 )
             is_critical = True
