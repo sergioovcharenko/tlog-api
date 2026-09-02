@@ -1,4 +1,5 @@
-# V23.30: backend logic unchanged; DR max-distance fallback is UI-only in HTML.
+# v1.0 «Швидкість» — safe performance branch; core analysis calculations preserved.
+# V23.31: backend logic unchanged; distance display logic remains UI-only in HTML.
 # V23.26 — power-priority diagnostics + exact per-flight battery statistics
 # V23.28 — clearer powertrain wording; competing-cause logic preserved
 # ============================================================
@@ -26,9 +27,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
+from starlette.middleware.gzip import GZipMiddleware
+import shutil
 from pymavlink import mavutil
 
 app = FastAPI()
+# v1.0 «Швидкість»: compress large JSON responses. This does not alter analysis values.
+app.add_middleware(GZipMiddleware, minimum_size=4096, compresslevel=5)
 
 # ============================================================
 # CONFIG
@@ -1243,11 +1248,19 @@ def offline_index():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    data = await file.read()
-
+    # v1.0 «Швидкість»: copy the uploaded TLOG in chunks instead of creating
+    # a second full-size bytes object in RAM. Parsing and calculation logic below
+    # remains unchanged, so telemetry results stay 1:1 with the previous branch.
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".tlog")
-    temp.write(data)
-    temp.close()
+    try:
+        await file.seek(0)
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            temp.write(chunk)
+    finally:
+        temp.close()
 
     try:
         mav = mavutil.mavlink_connection(temp.name)
