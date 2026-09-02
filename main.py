@@ -1,3 +1,4 @@
+# V23.30: backend logic unchanged; DR max-distance fallback is UI-only in HTML.
 # V23.26 — power-priority diagnostics + exact per-flight battery statistics
 # V23.28 — clearer powertrain wording; competing-cause logic preserved
 # ============================================================
