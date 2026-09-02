@@ -1,4 +1,3 @@
-# v1.2 3D MAP: backend algorithms unchanged; 3D is UI-only in HTML.
 # v1.1 «Швидкість» — safe performance branch; core analysis calculations preserved.
 # V23.31: backend logic unchanged; distance display logic remains UI-only in HTML.
 # V23.26 — power-priority diagnostics + exact per-flight battery statistics
