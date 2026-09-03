@@ -1359,6 +1359,17 @@ async def analyze(file: UploadFile = File(...)):
         max_radio_bad_duration = 0.0
         radio_bad_samples = 0
 
+        # LINK LOSS / RESTORE analysis.
+        # This is intentionally independent of flight ARM state so ground tests
+        # are also visible in Timeline. A -128 dBm sample means the last received
+        # radio status reports complete telemetry loss. RC/VTX changes made while
+        # MAVLink is absent cannot be timestamped by TLOG; we compare the last
+        # known state before loss with the first known state after recovery.
+        communication_loss_active = None
+        communication_loss_episodes = []
+        communication_loss_count = 0
+        communication_restore_count = 0
+
         # RC
         rc_min = {i: 9999 for i in range(1, 19)}
         rc_max = {i: 0 for i in range(1, 19)}
@@ -1757,6 +1768,44 @@ async def analyze(file: UploadFile = File(...)):
                     "eventType": "SNAPSHOT",
                     "isError": False,
                 }
+            )
+
+        def communication_vtx_state_snapshot():
+            return {
+                "ch7": curr_rc_channels.get(7),
+                "ch8": curr_rc_channels.get(8),
+                "band": curr_vtx_band,
+                "channel": curr_vtx_channel,
+                "frequency": curr_video_freq,
+            }
+
+        def communication_vtx_state_text(state):
+            if not isinstance(state, dict):
+                return "CH7/CH8 —"
+            ch7 = state.get("ch7")
+            ch8 = state.get("ch8")
+            freq = state.get("frequency")
+            band = state.get("band")
+            channel = state.get("channel")
+            parts = []
+            if ch7 is not None:
+                parts.append(f"CH7 {int(round(ch7))} us")
+            if ch8 is not None:
+                parts.append(f"CH8 {int(round(ch8))} us")
+            if freq is not None:
+                parts.append(f"VTX {freq} MHz")
+            elif band or channel:
+                parts.append(f"VTX {band or '—'} / {channel or '—'}")
+            return ", ".join(parts) if parts else "CH7/CH8 —"
+
+        def communication_state_changed(before, after):
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                return False
+            # CH7/CH8 are the primary evidence because VTX frequency is derived from them.
+            return (
+                before.get("ch7") != after.get("ch7")
+                or before.get("ch8") != after.get("ch8")
+                or before.get("frequency") != after.get("frequency")
             )
 
         def update_vtx_from_rc(ch7, ch8, timestamp):
@@ -2383,10 +2432,74 @@ async def analyze(file: UploadFile = File(...)):
                 telem_remrssi_raw = getattr(msg, "remrssi", 0)
 
                 dbm_val = parse_dbm(telem_rssi_raw)
+                previous_dbm = curr_dbm
                 curr_dbm = dbm_val
 
                 if dbm_val != 0 and (min_dbm == 0 or dbm_val < min_dbm):
                     min_dbm = dbm_val
+
+                # Exact transition into -128 dBm. This event is logged even on the ground.
+                # If MAVLink stops immediately afterwards, this remains the last exact
+                # point known from TLOG.
+                if dbm_val <= RADIO_LINK_LOST_DBM and communication_loss_active is None:
+                    communication_loss_count += 1
+                    before_state = communication_vtx_state_snapshot()
+                    communication_loss_active = {
+                        "startTimestamp": current_timestamp,
+                        "startDbm": dbm_val,
+                        "before": before_state,
+                    }
+                    add_event(
+                        "🔴 COMMUNICATION LOST: -128 dBm. "
+                        + "Останній відомий стан перед сліпою зоною: "
+                        + communication_vtx_state_text(before_state)
+                        + ". Поки MAVLink відсутній, точний момент перемикання CH7/CH8 у TLOG не записується.",
+                        current_timestamp,
+                        current_mode,
+                        True,
+                        False,
+                        "COMMUNICATION_LOST",
+                    )
+
+                # Link recovery is confirmed only by a RADIO/RADIO_STATUS sample above -128.
+                elif dbm_val > RADIO_LINK_LOST_DBM and communication_loss_active is not None:
+                    after_state = communication_vtx_state_snapshot()
+                    start_ts = communication_loss_active.get("startTimestamp", current_timestamp)
+                    duration = max(0.0, current_timestamp - start_ts)
+                    before_state = communication_loss_active.get("before") or {}
+                    changed = communication_state_changed(before_state, after_state)
+
+                    episode = {
+                        "startTimestamp": start_ts,
+                        "endTimestamp": current_timestamp,
+                        "durationSec": round(duration, 3),
+                        "startDbm": communication_loss_active.get("startDbm", -128),
+                        "restoreDbm": dbm_val,
+                        "recovered": True,
+                        "vtxChangedAcrossBlindZone": bool(changed),
+                        "before": before_state,
+                        "after": after_state,
+                    }
+                    communication_loss_episodes.append(episode)
+                    communication_restore_count += 1
+
+                    change_text = (
+                        " ⚠️ Стан CH7/CH8/VTX після відновлення відрізняється від стану до втрати; "
+                        "перемикання відбулося всередині сліпої зони, точний час невідомий."
+                        if changed else
+                        " Стан CH7/CH8/VTX до та після втрати однаковий."
+                    )
+                    add_event(
+                        f"🟢 COMMUNICATION RESTORED: {round(dbm_val)} dBm після {duration:.2f} с без підтвердженого радіолінку. "
+                        + "Після відновлення: " + communication_vtx_state_text(after_state) + "."
+                        + change_text,
+                        current_timestamp,
+                        current_mode,
+                        False,
+                        False,
+                        "COMMUNICATION_RESTORED",
+                    )
+                    communication_loss_active = None
 
                 radio_bad = (
                     dbm_val <= -128
@@ -3449,6 +3562,22 @@ async def analyze(file: UploadFile = File(...)):
             else "Немає даних"
         )
 
+        # If the log ends while -128 is still active, keep an explicit unrecovered episode.
+        # Duration is unknown beyond the last received MAVLink timestamp, therefore we do
+        # not invent a longer duration.
+        if communication_loss_active is not None:
+            communication_loss_episodes.append({
+                "startTimestamp": communication_loss_active.get("startTimestamp"),
+                "endTimestamp": None,
+                "durationSec": None,
+                "startDbm": communication_loss_active.get("startDbm", -128),
+                "restoreDbm": None,
+                "recovered": False,
+                "vtxChangedAcrossBlindZone": None,
+                "before": communication_loss_active.get("before") or {},
+                "after": None,
+            })
+
         # ====================================================
         # AI / FLIGHT ANALYSIS
         # ====================================================
@@ -3461,6 +3590,45 @@ async def analyze(file: UploadFile = File(...)):
         accelerometer_calibration_session = bool(
             ground_session and accel_calibration_events
         )
+
+        # Communication-loss summary. Works for both flight and ground sessions.
+        if communication_loss_episodes:
+            recovered_eps = [ep for ep in communication_loss_episodes if ep.get("recovered")]
+            open_eps = [ep for ep in communication_loss_episodes if not ep.get("recovered")]
+            changed_eps = [ep for ep in recovered_eps if ep.get("vtxChangedAcrossBlindZone")]
+            durations = [
+                float(ep.get("durationSec"))
+                for ep in recovered_eps
+                if valid_number(ep.get("durationSec"))
+            ]
+            longest = max(durations) if durations else None
+            first_loss_time = format_timeline_time(
+                communication_loss_episodes[0].get("startTimestamp"), base_t
+            )
+            longest_text = f"; найдовша підтверджена пауза {longest:.2f} с" if longest is not None else ""
+            ai_alerts.append(
+                f'<span class="ai-jump" data-jump-time="{first_loss_time}">'
+                f"📡 <b>Втрати MAVLink/радіолінку:</b> зафіксовано {len(communication_loss_episodes)} еп.; "
+                f"відновлено {len(recovered_eps)}{longest_text}. "
+                f"Подій зі зміною CH7/CH8/VTX між останнім станом до втрати та першим станом після відновлення: {len(changed_eps)}. "
+                "Під час -128 dBm точні проміжні перемикання не можуть бути відновлені з TLOG, якщо MAVLink у цей час був відсутній. "
+                "Натисніть, щоб перейти до першої втрати зв'язку.</span>"
+            )
+            if changed_eps:
+                ep = changed_eps[0]
+                t = format_timeline_time(ep.get("endTimestamp"), base_t)
+                ai_alerts.append(
+                    f'<span class="ai-jump" data-jump-time="{t}">'
+                    "⚠️ <b>VTX/CH7/CH8 змінився у сліпій зоні:</b> "
+                    + communication_vtx_state_text(ep.get("before"))
+                    + " → " + communication_vtx_state_text(ep.get("after"))
+                    + ". Точний момент перемикання TLOG не містить. "
+                    "Натисніть, щоб перейти до моменту відновлення.</span>"
+                )
+            if open_eps:
+                ai_alerts.append(
+                    "🔴 <b>Є невідновлена втрата зв'язку:</b> TLOG завершився без підтвердженого RADIO/RADIO_STATUS > -128 dBm після останньої втрати."
+                )
 
         # Завершення польоту / LAND -> automatic DISARM
         if disarm_detected:
@@ -4508,6 +4676,13 @@ async def analyze(file: UploadFile = File(...)):
                 ),
                 "maxThrottle": f"{round(max_throttle)}%",
                 "maxDropout": round(max_radio_bad_duration, 2),
+                "communicationLossCount": len(communication_loss_episodes),
+                "communicationRestoreCount": communication_restore_count,
+                "communicationLossEpisodes": communication_loss_episodes,
+                "communicationVtxChangedCount": len([
+                    ep for ep in communication_loss_episodes
+                    if ep.get("vtxChangedAcrossBlindZone") is True
+                ]),
                 "hasGps": (
                     "GPS Присутній"
                     if has_gps
