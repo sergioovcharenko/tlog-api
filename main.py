@@ -1,4 +1,4 @@
-# v1.1 «Швидкість» — safe performance branch; core analysis calculations preserved.
+# v1.0 «Швидкість» — safe performance branch; core analysis calculations preserved.
 # V23.31: backend logic unchanged; distance display logic remains UI-only in HTML.
 # V23.26 — power-priority diagnostics + exact per-flight battery statistics
 # V23.28 — clearer powertrain wording; competing-cause logic preserved
@@ -1248,7 +1248,6 @@ def offline_index():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    # v1.1 «Швидкість»: preserve v1.0 chunked upload; calculation algorithms unchanged.
     # v1.0 «Швидкість»: copy the uploaded TLOG in chunks instead of creating
     # a second full-size bytes object in RAM. Parsing and calculation logic below
     # remains unchanged, so telemetry results stay 1:1 with the previous branch.
